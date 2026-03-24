@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 from opentelemetry import trace
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -311,6 +311,14 @@ def _build_langfuse_client() -> Optional["Langfuse"]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _openai_client() -> OpenAI:
+    # Azure OpenAI endpoints require the AzureOpenAI client
+    if OPENAI_BASE_URL and ".openai.azure.com" in OPENAI_BASE_URL:
+        return AzureOpenAI(
+            api_key=OPENAI_API_KEY,
+            azure_endpoint=OPENAI_BASE_URL,
+            api_version=os.getenv("AZURE_API_VERSION", "2025-04-01-preview"),
+            timeout=120.0,
+        )
     return OpenAI(
         api_key=OPENAI_API_KEY or "not-needed",
         base_url=OPENAI_BASE_URL,
@@ -515,10 +523,20 @@ def _mcp_jsonrpc_call(
     Send a JSON-RPC 2.0 request to an MCP server and parse the SSE response.
     Returns (result_dict, session_id).
     """
+    # Derive the origin so MCP servers accept requests even when the URL
+    # uses host.docker.internal (DNS-rebinding protection expects localhost).
+    from urllib.parse import urlparse
+    parsed_url = urlparse(url)
+    origin_host = "localhost" if "host.docker.internal" in (parsed_url.hostname or "") else parsed_url.hostname
+    origin_port = f":{parsed_url.port}" if parsed_url.port else ""
+    origin = f"{parsed_url.scheme}://{origin_host}{origin_port}"
+
     headers: Dict[str, str] = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "User-Agent": f"{AGENT_NAME}/3.0",
+        "Origin": origin,
+        "Host": f"{origin_host}{origin_port}",
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
