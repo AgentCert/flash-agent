@@ -772,6 +772,10 @@ def _build_mcp_trace_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]
     else:
         summary["argo_workflows"] = {"count": 0}
 
+    # NOTE: experiment_info is NOT included here on purpose.
+    # It is injected directly into MCP span output and step metadata,
+    # but must NOT flow into the LLM analysis prompt/input.
+
     # ── pods_log → log sizes + key signals per pod ───────────────────────────
     pods_log = mcp_data.get("pods_log", {})
     if isinstance(pods_log, dict) and pods_log:
@@ -942,6 +946,46 @@ def agent_call_mcp_server(
             else:
                 logger.info("Phase 2: no active workflow pods found for log fetching")
 
+            # ── Phase 3: Fetch full Workflow resource for experiment IDs ──────
+            #    Extracts experimentId (workflow_id), runId (UID), infra_id, etc.
+            #    from Argo Workflow metadata.labels and metadata.uid.
+            wf_phases = _parse_workflow_phase_from_text(
+                all_results.get("argo_workflows", {})
+            )
+            latest_wf_name, _ = _get_latest_workflow(wf_phases)
+            if latest_wf_name:
+                logger.info(
+                    "Phase 3: fetching full Workflow resource for '%s' to extract IDs",
+                    latest_wf_name,
+                )
+                try:
+                    phase3_id = next_id if 'next_id' in dir() else len(tool_calls) + 20
+                    wf_detail_result, session_id = _mcp_jsonrpc_call(
+                        url=url,
+                        method="tools/call",
+                        params={
+                            "name": "resources_get",
+                            "arguments": {
+                                "apiVersion": "argoproj.io/v1alpha1",
+                                "kind": "Workflow",
+                                "namespace": CHAOS_NAMESPACE,
+                                "name": latest_wf_name,
+                            },
+                        },
+                        session_id=session_id,
+                        call_id=phase3_id,
+                    )
+                    all_results["workflow_detail"] = wf_detail_result
+                    workflow_ids = _extract_workflow_ids_from_resource(wf_detail_result)
+                    all_results["workflow_ids"] = workflow_ids
+                    logger.info("  Workflow IDs extracted: %s", workflow_ids)
+                except Exception as exc:
+                    logger.warning("  Phase 3 resources_get failed: %s", exc)
+                    all_results["workflow_ids"] = {}
+            else:
+                logger.info("Phase 3: no latest workflow found — skipping ID extraction")
+                all_results["workflow_ids"] = {}
+
         response_payload = {
             "server_type": server_type,
             "namespace":   K8S_NAMESPACE,
@@ -1002,6 +1046,20 @@ def agent_call_mcp_server(
             )
             # Build compact meaningful summary for trace (full data still goes to LLM)
             trace_output = _build_mcp_trace_summary(response_payload)
+            # Inject experiment_info into MCP span output only (not LLM input)
+            # workflow_ids lives under response_payload["data"]["workflow_ids"]
+            _rp_data = response_payload.get("data", response_payload)
+            wf_ids = _rp_data.get("workflow_ids", {})
+            exp_id_val = wf_ids.get("workflow_id", "") if wf_ids else ""
+            exp_run_id_val = wf_ids.get("workflow_run_id", "") if wf_ids else ""
+            if wf_ids:
+                trace_output["experiment_info"] = {
+                    "experiment_id":     exp_id_val,
+                    "experiment_run_id": exp_run_id_val,
+                    "revision_id":      wf_ids.get("revision_id", ""),
+                    "infra_id":         wf_ids.get("infra_id", ""),
+                    "subject":          wf_ids.get("subject", ""),
+                }
             mcp_span.update(
                 output=trace_output,
                 metadata={
@@ -1009,6 +1067,8 @@ def agent_call_mcp_server(
                     "url":          url,
                     "duration_sec": round(duration, 3),
                     "has_error":    "error" in response_payload,
+                    "experiment_id":     exp_id_val,
+                    "experiment_run_id": exp_run_id_val,
                 },
             )
             mcp_span.end()
@@ -1108,6 +1168,74 @@ def _extract_mcp_text(mcp_result: Any) -> str:
                 if isinstance(item, dict) and item.get("type") == "text":
                     return item.get("text", "")
     return str(mcp_result) if mcp_result else ""
+
+
+def _extract_workflow_ids_from_resource(mcp_result: Any) -> Dict[str, str]:
+    """
+    Extract experiment IDs from a full Argo Workflow resource returned by
+    MCP resources_get.  Parses metadata.labels and metadata.uid.
+
+    Returns dict with keys: workflow_id (experimentId), workflow_run_id (runId),
+    revision_id, infra_id, subject, workflow_name.
+    """
+    import re as _re_wf
+
+    ids: Dict[str, str] = {}
+    text = _extract_mcp_text(mcp_result)
+    if not text:
+        return ids
+
+    # Strategy: try JSON → YAML → regex (most to least structured)
+    resource: Dict[str, Any] = {}
+    parsed = False
+
+    # 1. Try JSON
+    if text.strip().startswith("{"):
+        try:
+            resource = json.loads(text)
+            parsed = True
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 2. Try YAML (if not already parsed)
+    if not parsed:
+        try:
+            import yaml
+            resource = yaml.safe_load(text) or {}
+            parsed = bool(resource and isinstance(resource, dict))
+        except Exception:
+            parsed = False
+
+    # 3. Extract from parsed dict
+    if parsed and isinstance(resource, dict):
+        metadata = resource.get("metadata", {})
+        if isinstance(metadata, dict):
+            labels = metadata.get("labels", {}) or {}
+            ids["uid"] = metadata.get("uid", "")
+            ids["workflow_run_id"] = metadata.get("uid", "")
+            ids["workflow_id"] = labels.get("workflow_id", "")
+            ids["revision_id"] = labels.get("revision_id", "")
+            ids["infra_id"] = labels.get("infra_id", "")
+            ids["subject"] = labels.get("subject", "")
+            ids["workflow_name"] = metadata.get("name", "")
+
+    # 4. Fallback: regex extraction from raw text (always runs if dict parsing missed keys)
+    if not ids.get("workflow_id"):
+        for key in ("workflow_id", "revision_id", "infra_id", "subject"):
+            m = _re_wf.search(rf"{key}:\s*(\S+)", text)
+            if m:
+                ids[key] = m.group(1).strip("\"'")
+    if not ids.get("workflow_run_id"):
+        uid_m = _re_wf.search(r"uid:\s*([0-9a-f-]{36})", text)
+        if uid_m:
+            ids["uid"] = uid_m.group(1)
+            ids["workflow_run_id"] = uid_m.group(1)
+    if not ids.get("workflow_name"):
+        name_m = _re_wf.search(r"^\s+name:\s*(\S+)", text, _re_wf.MULTILINE)
+        if name_m:
+            ids["workflow_name"] = name_m.group(1).strip("\"'")
+
+    return {k: v for k, v in ids.items() if v}
 
 
 def _parse_workflow_phase_from_text(argo_data: Any) -> Dict[str, str]:
@@ -1393,6 +1521,11 @@ def _record_workflow_step_spans(
     wf_phases = _parse_workflow_phase_from_text(mcp_data.get("argo_workflows", {}))
     latest_wf_name, latest_wf_phase = _get_latest_workflow(wf_phases)
 
+    # 2b. Extract experiment IDs from Phase 3 data
+    workflow_ids = mcp_data.get("workflow_ids", {})
+    experiment_id = workflow_ids.get("workflow_id", "")
+    experiment_run_id = workflow_ids.get("workflow_run_id", "")
+
     # 3. Build lookup from LLM chaos_faults for impact/recovery descriptions
     llm_faults: Dict[str, Dict] = {}
     if llm_analysis:
@@ -1447,6 +1580,8 @@ def _record_workflow_step_spans(
             }
 
             span_output: Dict[str, Any] = {
+                "experiment_id": experiment_id,
+                "experiment_run_id": experiment_run_id,
                 "verdict_source": "chaos-exporter logs (real)",
                 "verdict": real_verdict,
                 "probe_success_percentage": probe_pct,
@@ -1486,6 +1621,8 @@ def _record_workflow_step_spans(
                 "type": "infrastructure",
             }
             span_output = {
+                "experiment_id": experiment_id,
+                "experiment_run_id": experiment_run_id,
                 "phase": phase,
                 "workflow": latest_wf_name,
                 "details": llm_step.get("details", "N/A"),
@@ -1503,6 +1640,8 @@ def _record_workflow_step_spans(
                     "step_index": i,
                     "is_chaos_fault": is_chaos,
                     "workflow": latest_wf_name or "unknown",
+                    "experiment_id": experiment_id,
+                    "experiment_run_id": experiment_run_id,
                 },
             )
             step_span.update(output=span_output)
@@ -2026,6 +2165,15 @@ def agent_request_llm_analysis(
                     "raw_snippet": (output_text or "")[:500],
                 }
 
+            # Inject experiment_info into LLM analysis output (from mcp_data)
+            _llm_mcp_data = mcp_data.get("data", mcp_data) if isinstance(mcp_data, dict) else {}
+            _llm_wf_ids = _llm_mcp_data.get("workflow_ids", {}) if isinstance(_llm_mcp_data, dict) else {}
+            _llm_exp_id = _llm_wf_ids.get("workflow_id", "") if _llm_wf_ids else ""
+            _llm_exp_run_id = _llm_wf_ids.get("workflow_run_id", "") if _llm_wf_ids else ""
+            if _llm_exp_id or _llm_exp_run_id:
+                trace_output["experiment_id"] = _llm_exp_id
+                trace_output["experiment_run_id"] = _llm_exp_run_id
+
             lf_generation.update(
                 output=trace_output,
                 usage_details={
@@ -2040,6 +2188,8 @@ def agent_request_llm_analysis(
                     "health_score":     result.get("health", {}).get("overall_health_score") if result else None,
                     "duration_sec":     round(duration, 3),
                     "raw_output_snippet": (output_text or "")[:300],
+                    "experiment_id":     _llm_exp_id,
+                    "experiment_run_id": _llm_exp_run_id,
                 },
             )
             lf_generation.end()
@@ -2208,6 +2358,7 @@ def _run_scan_steps(
                     if has_root_core and len(root_matched) >= 2:
                         scan_output = {
                             "experiment": result.get("experiment_summary", {}),
+                            "experiment_info": result.get("experiment_info", {}),
                             "chaos_faults_summary": [
                                 {
                                     "fault": f.get("fault_name"),
@@ -2232,10 +2383,12 @@ def _run_scan_steps(
                 root_span.update(
                     output=scan_output,
                     metadata={
-                        "duration_sec":    round(duration, 3),
-                        "health_score":    health.get("overall_health_score"),
-                        "issue_count":     len(result.get("issues", [])) if isinstance(result, dict) else 0,
-                        "scan_number":     _scan_counter,
+                        "duration_sec":       round(duration, 3),
+                        "health_score":       health.get("overall_health_score"),
+                        "issue_count":        len(result.get("issues", [])) if isinstance(result, dict) else 0,
+                        "scan_number":        _scan_counter,
+                        "experiment_id":      result.get("experiment_info", {}).get("experiment_id", "") if isinstance(result, dict) else "",
+                        "experiment_run_id":  result.get("experiment_info", {}).get("experiment_run_id", "") if isinstance(result, dict) else "",
                     },
                 )
         except Exception as exc:
@@ -2319,6 +2472,36 @@ def _execute_scan_steps(
             except Exception as exc:
                 logger.warning("Failed to record workflow step spans: %s", exc)
         return {"health": {"overall_health_score": -1}, "issues": []}
+
+    # ── Inject experiment IDs from MCP Phase 3 into analysis result ───────────
+    #    These come from Argo Workflow metadata.labels (resources_get),
+    #    NOT from the LLM — so they are always accurate.
+    mcp_inner_ids = mcp_data.get("data", {})
+    workflow_ids = mcp_inner_ids.get("workflow_ids", {})
+    if workflow_ids:
+        experiment_id = workflow_ids.get("workflow_id", "")
+        experiment_run_id = workflow_ids.get("workflow_run_id", "")
+        analysis["experiment_info"] = {
+            "experiment_id": experiment_id,
+            "experiment_run_id": experiment_run_id,
+            "revision_id": workflow_ids.get("revision_id", ""),
+            "infra_id": workflow_ids.get("infra_id", ""),
+            "subject": workflow_ids.get("subject", ""),
+            "workflow_name": workflow_ids.get("workflow_name", ""),
+        }
+        # Also enrich experiment_summary with the IDs
+        exp_summary = analysis.get("experiment_summary", {})
+        if exp_summary:
+            exp_summary["experiment_id"] = experiment_id
+            exp_summary["experiment_run_id"] = experiment_run_id
+        logger.info(
+            "Injected experiment IDs: experiment_id=%s experiment_run_id=%s",
+            experiment_id or "N/A",
+            experiment_run_id or "N/A",
+        )
+    else:
+        analysis["experiment_info"] = {}
+        logger.info("No workflow IDs available to inject (Phase 3 may have failed)")
 
     # ── Step 3b: Record per-workflow-step Langfuse spans ─────────────────────
     #    Uses chaos-exporter logs for REAL verdicts + LLM output for descriptions
