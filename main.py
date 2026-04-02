@@ -386,6 +386,17 @@ def agent_request_tool_selection(
             messages=messages,
             temperature=0,
             max_tokens=50,
+            extra_body={
+                "metadata": {
+                    "scan_id": scan_id,
+                    "step": "tool-selection",
+                    "namespace": K8S_NAMESPACE,
+                    "agent": AGENT_NAME,
+                    "experiment_id": "",
+                    "experiment_run_id": "",
+                    "workflow_name": "",
+                }
+            },
         )
         msg = resp.choices[0].message
         # Some models (reasoning) return content=None; fall back to reasoning_content
@@ -2029,11 +2040,26 @@ def agent_request_llm_analysis(
     usage: Dict[str, int] = {}
     t0 = time.time()
 
+    # Extract experiment IDs from MCP Phase 3 data (already fetched)
+    _mcp_inner = mcp_data.get("data", mcp_data) if isinstance(mcp_data, dict) else {}
+    _wf_ids = _mcp_inner.get("workflow_ids", {}) if isinstance(_mcp_inner, dict) else {}
+
     try:
         resp = _openai_client().chat.completions.create(
             model=MODEL_ALIAS,
             messages=messages,
             temperature=0.1,
+            extra_body={
+                "metadata": {
+                    "scan_id": scan_id,
+                    "step": "llm-analysis",
+                    "namespace": K8S_NAMESPACE,
+                    "agent": AGENT_NAME,
+                    "experiment_id": _wf_ids.get("workflow_id", ""),
+                    "experiment_run_id": _wf_ids.get("workflow_run_id", ""),
+                    "workflow_name": _wf_ids.get("workflow_name", ""),
+                }
+            },
         )
         msg = resp.choices[0].message
         # Handle reasoning-only models where content may be None
