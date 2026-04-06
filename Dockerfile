@@ -18,7 +18,11 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Copy application
-COPY flash-agent/main.py .
+COPY flash-agent/main.py flash-agent/config.py flash-agent/agent_interface.py flash-agent/flash_agent.py ./
+COPY flash-agent/mcp/ ./mcp/
+COPY flash-agent/llm/ ./llm/
+COPY flash-agent/domain/ ./domain/
+COPY flash-agent/observability/ ./observability/
 
 # Set ownership
 RUN chown -R agent:agent /app
