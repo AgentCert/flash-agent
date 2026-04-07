@@ -3,7 +3,7 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-COPY flash-agent/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Final stage
@@ -18,7 +18,11 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Copy application
-COPY flash-agent/main.py .
+COPY main.py config.py agent_interface.py flash_agent.py ./
+COPY mcp/ ./mcp/
+COPY llm/ ./llm/
+COPY domain/ ./domain/
+COPY observability/ ./observability/
 
 # Set ownership
 RUN chown -R agent:agent /app
