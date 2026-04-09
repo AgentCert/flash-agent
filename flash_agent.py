@@ -314,7 +314,7 @@ class FlashAgent:
                                 "namespace": self.cfg.k8s_namespace,
                                 "name": pod_name,
                             }
-                            _app = os.getenv("TARGET_APP_POD_PATTERN", "sock-shop")
+                            _app = os.getenv("TARGET_APP_NAME", "sock-shop")
                             if (
                                 f"{_app}-trace" in pod_name
                                 or "argowf-chaos" in pod_name

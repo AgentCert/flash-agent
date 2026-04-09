@@ -50,6 +50,7 @@ class AgentConfig:
 
     # Chaos context
     chaos_namespace: str
+    target_app_name: str
 
     # Scan behaviour
     scan_interval: int
@@ -83,6 +84,7 @@ class AgentConfig:
             mcp_timeout=int(os.getenv("MCP_TIMEOUT", "30")),
             mcp_interactions_file=os.getenv("MCP_INTERACTIONS_FILE", ""),
             chaos_namespace=os.getenv("CHAOS_NAMESPACE", "litmus"),
+            target_app_name=os.getenv("TARGET_APP_NAME", "sock-shop"),
             scan_interval=int(os.getenv("SCAN_INTERVAL", "0")),
             scan_query=os.getenv(
                 "SCAN_QUERY",
