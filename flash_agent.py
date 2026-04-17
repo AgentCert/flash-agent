@@ -142,11 +142,14 @@ class FlashAgent:
             "mcp_errors": mcp_data.get("error", None),
             "events_normal": _events_info.get("normal", 0),
             "events_warning": _events_info.get("warning", 0),
-            "workflows_total": _wf_info.get("count", 0),
-            "workflow_latest": _wf_info.get("latest", ""),
-            "chaos_engines_total": _chaos_info.get("count", 0),
-            "chaos_engine_names": _chaos_info.get("engines", []),
         }
+        # Only include chaos/workflow metadata when chaos tools are enabled,
+        # to prevent leaking chaos engine names into Langfuse trace metadata.
+        if self.cfg.include_chaos_tools:
+            agent_context["workflows_total"] = _wf_info.get("count", 0)
+            agent_context["workflow_latest"] = _wf_info.get("latest", "")
+            agent_context["chaos_engines_total"] = _chaos_info.get("count", 0)
+            agent_context["chaos_engine_names"] = _chaos_info.get("engines", [])
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
         analysis = request_llm_analysis(
@@ -245,7 +248,9 @@ class FlashAgent:
         # Get domain-specific tool call list
         if server_type == "kubernetes":
             tool_calls = get_kubernetes_tool_calls(
-                self.cfg.k8s_namespace, self.cfg.chaos_namespace
+                self.cfg.k8s_namespace,
+                self.cfg.chaos_namespace,
+                include_chaos=self.cfg.include_chaos_tools,
             )
         else:
             tool_calls = get_prometheus_tool_calls(self.cfg.k8s_namespace)
