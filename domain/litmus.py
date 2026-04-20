@@ -23,15 +23,21 @@ logger = logging.getLogger("flash-agent")
 
 
 def get_kubernetes_tool_calls(
-    k8s_namespace: str, chaos_namespace: str
+    k8s_namespace: str,
+    chaos_namespace: str,
+    include_chaos: bool = True,
 ) -> List[Tuple[str, Dict[str, Any], str]]:
     """
     Return the MCP tool call list for Kubernetes data collection.
 
     Each entry is (mcp_tool_name, arguments_dict, result_key).
-    Includes generic K8s calls + Litmus CRD + Argo Workflow calls.
+    Includes generic K8s calls + optionally Litmus CRD + Argo Workflow calls.
+
+    When include_chaos is False, chaos/Argo tools are omitted so that
+    their names never appear in Langfuse trace metadata (data-leakage
+    prevention for blind-observer mode).
     """
-    return [
+    calls: List[Tuple[str, Dict[str, Any], str]] = [
         (
             "pods_list_in_namespace",
             {"namespace": k8s_namespace},
@@ -39,37 +45,41 @@ def get_kubernetes_tool_calls(
         ),
         ("events_list", {"namespace": k8s_namespace}, "events_list"),
         ("pods_top", {"namespace": k8s_namespace}, "pods_top"),
-        # Litmus ChaosEngine CRs
-        (
-            "resources_list",
-            {
-                "apiVersion": "litmuschaos.io/v1alpha1",
-                "kind": "ChaosEngine",
-                "namespace": chaos_namespace,
-            },
-            "chaosengines",
-        ),
-        # Litmus ChaosResult CRs
-        (
-            "resources_list",
-            {
-                "apiVersion": "litmuschaos.io/v1alpha1",
-                "kind": "ChaosResult",
-                "namespace": chaos_namespace,
-            },
-            "chaosresults",
-        ),
-        # Argo Workflow resources
-        (
-            "resources_list",
-            {
-                "apiVersion": "argoproj.io/v1alpha1",
-                "kind": "Workflow",
-                "namespace": chaos_namespace,
-            },
-            "argo_workflows",
-        ),
     ]
+    if include_chaos:
+        calls.extend([
+            # Litmus ChaosEngine CRs
+            (
+                "resources_list",
+                {
+                    "apiVersion": "litmuschaos.io/v1alpha1",
+                    "kind": "ChaosEngine",
+                    "namespace": chaos_namespace,
+                },
+                "chaosengines",
+            ),
+            # Litmus ChaosResult CRs
+            (
+                "resources_list",
+                {
+                    "apiVersion": "litmuschaos.io/v1alpha1",
+                    "kind": "ChaosResult",
+                    "namespace": chaos_namespace,
+                },
+                "chaosresults",
+            ),
+            # Argo Workflow resources
+            (
+                "resources_list",
+                {
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Workflow",
+                    "namespace": chaos_namespace,
+                },
+                "argo_workflows",
+            ),
+        ])
+    return calls
 
 
 def get_prometheus_tool_calls(

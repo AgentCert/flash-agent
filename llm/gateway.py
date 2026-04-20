@@ -133,6 +133,7 @@ def build_llm_data_payload(
     mcp_data: Dict[str, Any],
     server_type: str,
     k8s_namespace: str,
+    include_chaos: bool = True,
 ) -> str:
     """
     Build a structured data payload for the LLM.
@@ -140,6 +141,10 @@ def build_llm_data_payload(
     Ensures the most important data (chaos-exporter logs with fault verdicts,
     Argo workflow list, pod status) is always included.
     Budget: ~12-15K chars total.
+
+    When include_chaos is False, chaos-specific sections (Argo Workflows,
+    ChaosResults, ChaosEngines, chaos-exporter/operator logs) are omitted
+    to prevent data leakage in Langfuse traces (blind-observer mode).
     """
     sections: List[str] = []
     sections.append(
@@ -166,73 +171,80 @@ def build_llm_data_payload(
         sections.append(f"## EVENTS\n{json.dumps(events)}")
 
     # ── 3. Argo Workflows (sorted newest-first, latest marked) ───────────────
-    argo = summary.get("argo_workflows", {})
-    if argo.get("count", 0) > 0:
-        latest_name = argo.get("latest", "")
-        wf_lines = []
-        for w in argo.get("workflows", []):
-            marker = " \u2190 LATEST" if w["name"] == latest_name else ""
-            wf_lines.append(
-                f"  - {w['name']}  phase={w.get('phase', '?')}  "
-                f"age={w.get('age', '?')}{marker}"
+    if include_chaos:
+        argo = summary.get("argo_workflows", {})
+        if argo.get("count", 0) > 0:
+            latest_name = argo.get("latest", "")
+            wf_lines = []
+            for w in argo.get("workflows", []):
+                marker = " \u2190 LATEST" if w["name"] == latest_name else ""
+                wf_lines.append(
+                    f"  - {w['name']}  phase={w.get('phase', '?')}  "
+                    f"age={w.get('age', '?')}{marker}"
+                )
+            sections.append(
+                f"## ARGO WORKFLOWS ({argo['count']} total)\n"
+                f"Latest experiment workflow: {latest_name}\n"
+                + "\n".join(wf_lines)
             )
-        sections.append(
-            f"## ARGO WORKFLOWS ({argo['count']} total)\n"
-            f"Latest experiment workflow: {latest_name}\n"
-            + "\n".join(wf_lines)
-        )
 
     # ── 4. ChaosResults ──────────────────────────────────────────────────────
-    cr = summary.get("chaosresults", {})
-    if cr.get("count", 0) > 0:
-        sections.append(
-            f"## CHAOSRESULTS ({cr['count']} total)\n"
-            f"  Names: {json.dumps(cr.get('results', []))}"
-        )
+    if include_chaos:
+        cr = summary.get("chaosresults", {})
+        if cr.get("count", 0) > 0:
+            sections.append(
+                f"## CHAOSRESULTS ({cr['count']} total)\n"
+                f"  Names: {json.dumps(cr.get('results', []))}"
+            )
 
     # ── 5. ChaosEngines ──────────────────────────────────────────────────────
-    ce = summary.get("chaosengines", {})
-    if ce.get("count", 0) > 0:
-        sections.append(
-            f"## CHAOSENGINES ({ce['count']} total)\n"
-            f"  Names: {json.dumps(ce.get('engines', []))}"
-        )
+    if include_chaos:
+        ce = summary.get("chaosengines", {})
+        if ce.get("count", 0) > 0:
+            sections.append(
+                f"## CHAOSENGINES ({ce['count']} total)\n"
+                f"  Names: {json.dumps(ce.get('engines', []))}"
+            )
 
     # ── 6. chaos-exporter logs (CRITICAL — contains fault verdicts) ──────────
-    pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
-    if isinstance(pods_log, dict):
-        for pod_name, log_data in pods_log.items():
-            if "chaos-exporter" in pod_name:
-                log_text = extract_mcp_text(log_data)
-                if log_text:
-                    verdict_lines = [
-                        l.strip()
-                        for l in log_text.split("\n")
-                        if "FaultName=" in l
-                        or "ResultVerdict=" in l
-                        or "ProbeSuccessPercentage=" in l
-                    ]
-                    sections.append(
-                        f"## CHAOS-EXPORTER LOGS ({pod_name})\n"
-                        f"### Verdict lines (extracted):\n"
-                        + "\n".join(verdict_lines[-30:])
-                        + "\n\n"
-                        f"### Full log (truncated to 6000 chars):\n"
-                        + log_text[-6000:]
-                    )
+    if include_chaos:
+        pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
+        if isinstance(pods_log, dict):
+            for pod_name, log_data in pods_log.items():
+                if "chaos-exporter" in pod_name:
+                    log_text = extract_mcp_text(log_data)
+                    if log_text:
+                        verdict_lines = [
+                            l.strip()
+                            for l in log_text.split("\n")
+                            if "FaultName=" in l
+                            or "ResultVerdict=" in l
+                            or "ProbeSuccessPercentage=" in l
+                        ]
+                        sections.append(
+                            f"## CHAOS-EXPORTER LOGS ({pod_name})\n"
+                            f"### Verdict lines (extracted):\n"
+                            + "\n".join(verdict_lines[-30:])
+                            + "\n\n"
+                            f"### Full log (truncated to 6000 chars):\n"
+                            + log_text[-6000:]
+                        )
 
     # ── 7. chaos-operator logs (compact) ─────────────────────────────────────
-    if isinstance(pods_log, dict):
-        for pod_name, log_data in pods_log.items():
-            if "chaos-operator" in pod_name:
-                log_text = extract_mcp_text(log_data)
-                if log_text:
-                    sections.append(
-                        f"## CHAOS-OPERATOR LOGS ({pod_name})\n"
-                        + log_text[-2000:]
-                    )
+    if include_chaos:
+        pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
+        if isinstance(pods_log, dict):
+            for pod_name, log_data in pods_log.items():
+                if "chaos-operator" in pod_name:
+                    log_text = extract_mcp_text(log_data)
+                    if log_text:
+                        sections.append(
+                            f"## CHAOS-OPERATOR LOGS ({pod_name})\n"
+                            + log_text[-2000:]
+                        )
 
     # ── 8. Workflow pod logs (error lines only) ──────────────────────────────
+    pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
     if isinstance(pods_log, dict):
         wf_log_parts: List[str] = []
         for pod_name, log_data in pods_log.items():
@@ -279,7 +291,10 @@ def request_llm_analysis(
     Returns parsed analysis dict or None on failure.
     """
     analysis_prompt = _load_prompt("analysis")
-    payload_text = build_llm_data_payload(mcp_data, server_type, cfg.k8s_namespace)
+    payload_text = build_llm_data_payload(
+        mcp_data, server_type, cfg.k8s_namespace,
+        include_chaos=cfg.include_chaos_tools,
+    )
 
     combined_prompt = (
         f"INSTRUCTIONS:\n{analysis_prompt}\n\n"

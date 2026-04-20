@@ -51,6 +51,7 @@ class AgentConfig:
     # Chaos context
     chaos_namespace: str
     target_app_name: str
+    include_chaos_tools: bool
 
     # Scan behaviour
     scan_interval: int
@@ -85,6 +86,9 @@ class AgentConfig:
             mcp_interactions_file=os.getenv("MCP_INTERACTIONS_FILE", ""),
             chaos_namespace=os.getenv("CHAOS_NAMESPACE", "litmus"),
             target_app_name=os.getenv("TARGET_APP_NAME", "sock-shop"),
+            include_chaos_tools=os.getenv(
+                "MCP_INCLUDE_CHAOS_TOOLS", "true"
+            ).lower() in ("true", "1", "yes"),
             scan_interval=int(os.getenv("SCAN_INTERVAL", "0")),
             scan_query=os.getenv(
                 "SCAN_QUERY",
