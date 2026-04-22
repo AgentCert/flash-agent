@@ -30,6 +30,7 @@ class AgentConfig:
 
     # Agent identity
     agent_name: str
+    agent_id: str
     agent_mode: str
     k8s_namespace: str
     k8s_node_ip: str
@@ -70,15 +71,14 @@ class AgentConfig:
 
         return cls(
             agent_name=os.getenv("AGENT_NAME", ""),
+            agent_id=os.getenv("AGENT_ID", ""),
             agent_mode=os.getenv("AGENT_MODE", ""),
             k8s_namespace=k8s_namespace,
             k8s_node_ip=os.getenv("K8S_NODE_IP", ""),
             openai_base_url=os.getenv("OPENAI_BASE_URL", ""),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             model_alias=os.getenv("MODEL_ALIAS", ""),
-            azure_api_version=os.getenv(
-                "AZURE_API_VERSION", "2025-04-01-preview"
-            ),
+            azure_api_version=os.getenv("AZURE_API_VERSION", ""),
             k8s_mcp_url=os.getenv("K8S_MCP_URL", ""),
             prom_mcp_url=os.getenv("PROM_MCP_URL", ""),
             mcp_timeout=int(os.getenv("MCP_TIMEOUT", "30")),

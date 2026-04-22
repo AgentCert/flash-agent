@@ -16,13 +16,48 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from openai import AzureOpenAI, OpenAI
+from openai import OpenAI
 
 from config import AgentConfig
 from mcp.parsers import build_mcp_data_summary, extract_mcp_text
 from observability.langfuse import update_generation_metadata
 
 logger = logging.getLogger("flash-agent")
+
+
+# Per-process cache: model_alias → "max_tokens" | "max_completion_tokens".
+# Populated on first successful LLM call so the detection is model-agnostic:
+# we try max_tokens, catch the Azure rejection, switch to max_completion_tokens,
+# and never retry again for that model alias within this process lifetime.
+_model_token_param: dict[str, str] = {}
+
+
+def _chat_create(client, model_alias: str, max_tokens_value: int, **kwargs):
+    """Call chat.completions.create with automatic token-param detection.
+
+    Azure o-series and gpt-4o models reject 'max_tokens' and require
+    'max_completion_tokens'. We try max_tokens on the first call; on
+    rejection we switch and cache the result for the process lifetime.
+    """
+    param = _model_token_param.get(model_alias, "max_tokens")
+    try:
+        return client.chat.completions.create(**{param: max_tokens_value}, **kwargs)
+    except Exception as exc:
+        err = str(exc)
+        if param == "max_tokens" and (
+            "max_completion_tokens" in err or "not supported" in err.lower()
+        ):
+            logger.info(
+                "[token-param] model=%s rejected max_tokens – switching to "
+                "max_completion_tokens (cached for process lifetime)",
+                model_alias,
+            )
+            _model_token_param[model_alias] = "max_completion_tokens"
+            return client.chat.completions.create(
+                max_completion_tokens=max_tokens_value, **kwargs
+            )
+        raise
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt loading
@@ -43,19 +78,12 @@ def _load_prompt(name: str) -> str:
 
 def create_openai_client(cfg: AgentConfig) -> OpenAI:
     """
-    Create an OpenAI-compatible client.
+    Create an OpenAI-compatible client pointed at the LiteLLM proxy.
 
-    When openai_base_url points to an Azure endpoint (.openai.azure.com),
-    returns AzureOpenAI for direct Azure calls.  Otherwise returns the
-    standard OpenAI client (typically pointed at the LiteLLM proxy).
+    All LLM calls go through LiteLLM regardless of provider — this ensures
+    Langfuse tracing, retries, and sidecar metadata injection all work.
+    The proxy handles Azure/OpenAI/Anthropic routing based on its config.
     """
-    if cfg.openai_base_url and ".openai.azure.com" in cfg.openai_base_url:
-        return AzureOpenAI(
-            api_key=cfg.openai_api_key,
-            azure_endpoint=cfg.openai_base_url,
-            api_version=cfg.azure_api_version,
-            timeout=120.0,
-        )
     return OpenAI(
         api_key=cfg.openai_api_key or "not-needed",
         base_url=cfg.openai_base_url,
@@ -87,12 +115,15 @@ def request_tool_selection(
     decision = "kubernetes"
     t0 = time.time()
 
+
     try:
-        resp = create_openai_client(cfg).chat.completions.create(
+        resp = _chat_create(
+            create_openai_client(cfg),
+            cfg.model_alias,
+            50,
             model=cfg.model_alias,
             messages=messages,
             temperature=0,
-            max_tokens=50,
             extra_body={
                 "metadata": {
                     "generation_name": "tool_selection",
@@ -100,6 +131,7 @@ def request_tool_selection(
                     "step": "tool-selection",
                     "namespace": cfg.k8s_namespace,
                     "agent": cfg.agent_name,
+                    **({"agent_id": cfg.agent_id} if cfg.agent_id else {}),
                 }
             },
         )
@@ -285,6 +317,11 @@ def request_llm_analysis(
         f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
         f"DATA TO ANALYSE:\n{payload_text}"
     )
+
+    combined_prompt = (
+        f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
+        f"DATA TO ANALYSE:\n{payload_text}"
+    )
     messages: List[Dict[str, str]] = [
         {"role": "user", "content": combined_prompt},
     ]
@@ -303,8 +340,12 @@ def request_llm_analysis(
     usage: Optional[Dict[str, int]] = None
     result: Optional[Dict[str, Any]] = None
 
+
     try:
-        resp = create_openai_client(cfg).chat.completions.create(
+        resp = _chat_create(
+            create_openai_client(cfg),
+            cfg.model_alias,
+            16384,
             model=cfg.model_alias,
             messages=messages,
             temperature=0.1,
@@ -316,6 +357,7 @@ def request_llm_analysis(
                     "step": "llm-analysis",
                     "namespace": cfg.k8s_namespace,
                     "agent": cfg.agent_name,
+                    **({"agent_id": cfg.agent_id} if cfg.agent_id else {}),
                     **(agent_context or {}),
                 }
             },
