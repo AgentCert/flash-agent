@@ -339,6 +339,16 @@ def build_llm_data_payload(
     pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
     if isinstance(pods_log, dict):
         wf_log_parts: List[str] = []
+        # Issue 2 Fix: build anonymisation map for chaos runner pod names
+        # (argowf-chaos-<fault-type>-<suffix>) before the loop so each pod
+        # gets a stable label across all sections.
+        chaos_runner_pods = [
+            p for p in pods_log
+            if p not in ("chaos-exporter", "chaos-operator")
+            and ("argowf-chaos" in p or re.search(r"argowf-.*-\w{4,}", p))
+        ]
+        pod_name_map = _anonymize_chaos_names(chaos_runner_pods)
+
         for pod_name, log_data in pods_log.items():
             if "chaos-exporter" in pod_name or "chaos-operator" in pod_name:
                 continue
@@ -350,8 +360,9 @@ def build_llm_data_payload(
                     if "error" in l.lower() or "failed" in l.lower()
                 ]
                 if error_lines:
+                    display_name = pod_name_map.get(pod_name, pod_name)
                     wf_log_parts.append(
-                        f"  [{pod_name}] ({len(error_lines)} error lines):\n"
+                        f"  [{display_name}] ({len(error_lines)} error lines):\n"
                         + "\n".join(
                             f"    {l[:200]}" for l in error_lines[-5:]
                         )
