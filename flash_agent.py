@@ -123,27 +123,42 @@ class FlashAgent:
                 "MCP returned an error \u2013 analysis will reflect degraded data"
             )
 
-        # ── Issue 1 Fix: Fault verdict gate ──────────────────────────────────
-        # Skip LLM analysis only when NO ChaosResult has a final verdict yet
-        # (i.e. the very first scans before any fault step has completed).
-        # Once at least one fault has Pass/Fail, analysis runs so the certifier
-        # gets per-fault TTD/TTR as each fault completes — not one bulk analysis
-        # at the very end of the whole workflow.
+        # ── Issue 1 Fix: Chaos-active gate ───────────────────────────────────
+        # A blind ITOps agent has no knowledge of what faults are injected.
+        # It should start analysing as soon as chaos infrastructure is present
+        # in the namespace (ChaosEngines or ChaosResults appearing = chaos is
+        # active), not after a step "Succeeds".
+        #
+        # During the install phase (steps 1-2), there are no ChaosEngine or
+        # ChaosResult objects yet — the MCP list returns only the column header
+        # (~43 chars). Once chaos injection begins, objects are created and the
+        # text grows well beyond that.  We use 100 chars as the threshold.
+        #
+        # This preserves TTD accuracy: the certifier measures time from fault
+        # injection (ChaosEngine creation) to first agent detection, so the
+        # agent must start analysing as soon as it sees chaos infrastructure.
         if self.cfg.include_chaos_tools:
-            _cr_raw = mcp_data.get("data", {}).get("chaosresults", {})
-            _cr_text = extract_mcp_text(_cr_raw)
-            _has_verdict = bool(
-                _cr_text and (
-                    "Pass" in _cr_text or "Fail" in _cr_text
-                )
+            _cr_text = extract_mcp_text(
+                mcp_data.get("data", {}).get("chaosresults", {})
             )
-            if not _has_verdict:
+            _ce_text = extract_mcp_text(
+                mcp_data.get("data", {}).get("chaosengines", {})
+            )
+            _CHAOS_ACTIVE_THRESHOLD = 100  # chars — above header-only output
+            _chaos_active = (
+                len(_cr_text.strip()) > _CHAOS_ACTIVE_THRESHOLD
+                or len(_ce_text.strip()) > _CHAOS_ACTIVE_THRESHOLD
+            )
+            if not _chaos_active:
                 _argo_raw = mcp_data.get("data", {}).get("argo_workflows", {})
                 _wf_phases = parse_workflow_phase_from_text(_argo_raw)
                 _latest_wf_name, _latest_wf_phase = get_latest_workflow(_wf_phases)
                 logger.info(
-                    "No ChaosResult verdicts yet (workflow phase: %s) — "
-                    "skipping LLM analysis until at least one fault completes.",
+                    "Install phase — no chaos infrastructure yet "
+                    "(chaosengines: %d chars, chaosresults: %d chars, "
+                    "workflow: %s) — skipping LLM analysis.",
+                    len(_ce_text.strip()),
+                    len(_cr_text.strip()),
                     _latest_wf_phase or "unknown",
                 )
                 return {
@@ -153,7 +168,7 @@ class FlashAgent:
                     },
                     "issues": [],
                     "experiment_info": {},
-                    "_skipped_reason": "no_verdicts_yet",
+                    "_skipped_reason": "install_phase_no_chaos_infra",
                 }
 
         # ── Build agent context for Langfuse trace enrichment ────────────────
