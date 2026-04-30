@@ -64,12 +64,16 @@ def extract_active_pod_names(
     return pod_names
 
 
-def build_mcp_data_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool = True) -> Dict[str, Any]:
     """
     Build a compact structured summary of the MCP response data.
 
     Used by the LLM payload builder to extract pod status, events,
     workflow metadata and chaos results for the LLM analysis prompt.
+
+    When include_chaos is False, chaos-specific sections (ChaosEngines,
+    ChaosResults, Argo Workflows) are omitted to prevent fault identity
+    leakage in blind-observer mode.
     """
     if "error" in response_payload:
         return {
@@ -161,41 +165,45 @@ def build_mcp_data_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ── chaosengines → engine names ──────────────────────────────────────────
-    engines_text = extract_mcp_text(mcp_data.get("chaosengines", {}))
-    if engines_text and engines_text.strip():
-        engine_names: List[str] = []
-        for line in engines_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                engine_names.append(parts[3])
-        summary["chaosengines"] = {
-            "count": len(engine_names),
-            "engines": engine_names[:10],
-        }
-    else:
-        summary["chaosengines"] = {"count": 0}
+    if include_chaos:
+        engines_text = extract_mcp_text(mcp_data.get("chaosengines", {}))
+        if engines_text and engines_text.strip():
+            engine_names: List[str] = []
+            for line in engines_text.strip().split("\n"):
+                if line.startswith("NAMESPACE") or not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    engine_names.append(parts[3])
+            summary["chaosengines"] = {
+                "count": len(engine_names),
+                "engines": engine_names[:10],
+            }
+        else:
+            summary["chaosengines"] = {"count": 0}
 
     # ── chaosresults → result names ──────────────────────────────────────────
-    results_text = extract_mcp_text(mcp_data.get("chaosresults", {}))
-    if results_text and results_text.strip():
-        result_names: List[str] = []
-        for line in results_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                result_names.append(parts[3])
-        summary["chaosresults"] = {
-            "count": len(result_names),
-            "results": result_names[:10],
-        }
-    else:
-        summary["chaosresults"] = {"count": 0}
+    if include_chaos:
+        results_text = extract_mcp_text(mcp_data.get("chaosresults", {}))
+        if results_text and results_text.strip():
+            result_names: List[str] = []
+            for line in results_text.strip().split("\n"):
+                if line.startswith("NAMESPACE") or not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    result_names.append(parts[3])
+            summary["chaosresults"] = {
+                "count": len(result_names),
+                "results": result_names[:10],
+            }
+        else:
+            summary["chaosresults"] = {"count": 0}
 
     # ── argo_workflows → workflow name, phase, age ───────────────────────────
-    argo_text = extract_mcp_text(mcp_data.get("argo_workflows", {}))
+    if not include_chaos:
+        summary["argo_workflows"] = {"count": 0}
+    argo_text = extract_mcp_text(mcp_data.get("argo_workflows", {})) if include_chaos else ""
     if argo_text and argo_text.strip():
         workflows: List[Dict[str, str]] = []
         for line in argo_text.strip().split("\n"):

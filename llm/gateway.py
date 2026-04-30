@@ -182,7 +182,7 @@ def request_hindsight_check(
     {"sufficient": True} so the main analysis still runs.
     """
     hindsight_prompt = _load_prompt("hindsight")
-    summary = build_mcp_data_summary(mcp_data)
+    summary = build_mcp_data_summary(mcp_data, include_chaos=cfg.include_chaos_tools)
     summary_text = json.dumps(summary, indent=2)
 
     messages: List[Dict[str, str]] = [
@@ -399,9 +399,20 @@ def request_llm_analysis(
         include_chaos=cfg.include_chaos_tools,
     )
 
+    # If hindsight flagged thin data, append its next_focus guidance to the
+    # user message so the analysis LLM knows where to direct its attention
+    # rather than producing generic "insufficient data" responses.
+    user_content = f"DATA TO ANALYSE:\n{payload_text}"
+    ctx = agent_context or {}
+    if not ctx.get("data_sufficient", True) and ctx.get("data_quality_note"):
+        user_content += (
+            f"\n\nDATA QUALITY NOTE: The available data is limited. "
+            f"Focus your analysis on: {ctx['data_quality_note']}"
+        )
+
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": analysis_prompt},
-        {"role": "user", "content": f"DATA TO ANALYSE:\n{payload_text}"},
+        {"role": "user", "content": user_content},
     ]
 
     logger.info(
