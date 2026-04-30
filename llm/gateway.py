@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,11 +26,122 @@ from observability.langfuse import update_generation_metadata
 logger = logging.getLogger("flash-agent")
 
 
+# Structural K8s/Litmus resource-type keywords that always indicate identity leakage
+# regardless of which specific fault was injected.
+_LEAKAGE_STRUCTURAL: frozenset[str] = frozenset({
+    "chaosengine",
+    "chaosresult",
+    "workflow_name",
+    "argo-workflow",
+    "chaos-operator",
+    "chaos-exporter",
+})
+
+# Pattern: matches any Litmus-style fault name  <target>-<fault-action>
+# (e.g. pod-delete, node-drain, container-kill, k8s-pod-delete, disk-fill …)
+# Prefixes are ONLY real LitmusChaos target categories — not generic K8s terms
+# like "app" or "kubelet" which appear legitimately in logs.
+_FAULT_NAME_RE = re.compile(
+    r"\b(?:pod|node|container|disk|network|k8s|jvm)"
+    r"-(?:delete|hog|kill|fill|loss|drain|restart|corruption|latency|"
+    r"duplication|taint|stress|failure|error|partition|io|cpu|memory|network|chaos|method|gc|poweroff)\b",
+    re.IGNORECASE,
+)
+
+# FaultName=<value> key-value pairs that appear in chaos-exporter / operator logs.
+_FAULTNAME_KV_RE = re.compile(r"FaultName=(\S+)", re.IGNORECASE)
+
+
 # Per-process cache: model_alias → "max_tokens" | "max_completion_tokens".
 # Populated on first successful LLM call so the detection is model-agnostic:
 # we try max_tokens, catch the Azure rejection, switch to max_completion_tokens,
 # and never retry again for that model alias within this process lifetime.
 _model_token_param: dict[str, str] = {}
+
+
+def _sanitize_leakage_terms(text: str) -> tuple[str, list[str]]:
+    """Redact chaos identity markers from LLM user payload.
+
+    Three passes:
+    1. Structural keywords (chaosengine, chaosresult, …) - exact match, always redact.
+    2. Fault-name shaped strings (<target>-<fault-action>) - pattern match, covers any fault.
+    3. FaultName=<value> KV pairs in logs - captures explicit fault name assignments.
+    """
+    if not text:
+        return text, []
+
+    found: list[str] = []
+    sanitized = text
+
+    # Pass 1 – structural resource-type keywords
+    for term in _LEAKAGE_STRUCTURAL:
+        if term.lower() in sanitized.lower():
+            found.append(term)
+            sanitized = re.sub(re.escape(term), "[REDACTED]", sanitized, flags=re.IGNORECASE)
+
+    # Pass 2 – fault-name pattern (<target>-<fault-action>)
+    matches = _FAULT_NAME_RE.findall(sanitized)
+    if matches:
+        found.extend(matches)
+        sanitized = _FAULT_NAME_RE.sub("[FAULT-NAME]", sanitized)
+
+    # Pass 3 – FaultName=<value> KV pairs
+    kv_matches = _FAULTNAME_KV_RE.findall(sanitized)
+    if kv_matches:
+        found.extend([f"FaultName={v}" for v in kv_matches])
+        sanitized = _FAULTNAME_KV_RE.sub("FaultName=[REDACTED]", sanitized)
+
+    return sanitized, found
+
+
+def _build_structured_analysis_user_content(
+    cfg: AgentConfig,
+    server_type: str,
+    scan_id: str,
+    payload_text: str,
+    summary: Dict[str, Any],
+    agent_context: Optional[Dict[str, Any]],
+) -> str:
+    """Build explicit sectioned user payload for better instruction adherence."""
+    pods = summary.get("pods", {})
+    events = summary.get("events", {})
+    context = agent_context or {}
+
+    sections: List[str] = [
+        "CONTEXT",
+        f"- Namespace: {cfg.k8s_namespace}",
+        f"- Data Source: {server_type.upper()} MCP",
+        f"- Scan ID: {scan_id or 'N/A'}",
+        f"- Data Sufficient: {context.get('data_sufficient', True)}",
+        "",
+        "METRICS",
+        f"- Pods total: {pods.get('total', 0)}",
+        f"- Pod status breakdown: {json.dumps(pods.get('by_status', {}))}",
+        f"- Total restarts: {pods.get('total_restarts', 0)}",
+        f"- Events normal/warning: {events.get('normal', 0)}/{events.get('warning', 0)}",
+        "",
+        "EVENTS",
+        f"- Warning reasons: {json.dumps(events.get('warning_reasons', []))}",
+        "",
+        "LOGS AND RAW EVIDENCE",
+        payload_text,
+        "",
+        "CONSTRAINTS",
+        "- Analyze only the provided evidence.",
+        "- Do not infer fault identity unless explicitly evidenced in logs/metrics.",
+        "- Preserve strict JSON response schema from system prompt.",
+    ]
+
+    if not context.get("data_sufficient", True) and context.get("data_quality_note"):
+        sections.extend(
+            [
+                "",
+                "DATA QUALITY NOTE",
+                f"- Focus your analysis on: {context['data_quality_note']}",
+            ]
+        )
+
+    return "\n".join(sections)
 
 
 def _chat_create(client, model_alias: str, max_tokens_value: int, **kwargs):
@@ -437,16 +549,25 @@ def request_llm_analysis(
         mcp_data, server_type, cfg.k8s_namespace,
         include_chaos=cfg.include_chaos_tools,
     )
+    payload_summary = build_mcp_data_summary(
+        mcp_data,
+        include_chaos=cfg.include_chaos_tools,
+    )
 
-    # If hindsight flagged thin data, append its next_focus guidance to the
-    # user message so the analysis LLM knows where to direct its attention
-    # rather than producing generic "insufficient data" responses.
-    user_content = f"DATA TO ANALYSE:\n{payload_text}"
-    ctx = agent_context or {}
-    if not ctx.get("data_sufficient", True) and ctx.get("data_quality_note"):
-        user_content += (
-            f"\n\nDATA QUALITY NOTE: The available data is limited. "
-            f"Focus your analysis on: {ctx['data_quality_note']}"
+    user_content = _build_structured_analysis_user_content(
+        cfg=cfg,
+        server_type=server_type,
+        scan_id=scan_id,
+        payload_text=payload_text,
+        summary=payload_summary,
+        agent_context=agent_context,
+    )
+    user_content, leaked_terms = _sanitize_leakage_terms(user_content)
+    if leaked_terms:
+        logger.warning(
+            "Leakage guard redacted %d term(s) before llm_analysis: %s",
+            len(leaked_terms),
+            sorted(set(leaked_terms)),
         )
 
     messages: List[Dict[str, str]] = [
@@ -490,6 +611,7 @@ def request_llm_analysis(
                     "agent": cfg.agent_name,
                     **({"agent_id": cfg.agent_id} if cfg.agent_id else {}),
                     **(agent_context or {}),
+                    "redacted_terms": sorted(set(leaked_terms)) if leaked_terms else [],
                 }
             },
         )
