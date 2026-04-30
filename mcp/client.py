@@ -65,6 +65,19 @@ class MCPClient:
         )
         return result
 
+    def list_tools(self) -> list[Dict[str, Any]]:
+        """
+        Discover available tools from the MCP server.
+        
+        Returns a list of tool definitions with name, description, and inputSchema.
+        """
+        self._call_counter += 1
+        result, self._session_id = self._jsonrpc_call(
+            method="tools/list",
+            params={},
+        )
+        return result.get("tools", [])
+
     def _jsonrpc_call(
         self,
         method: str,
