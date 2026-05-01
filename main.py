@@ -20,6 +20,7 @@ import logging
 import os
 import signal
 import time
+from typing import Any
 
 from config import AgentConfig
 from flash_agent import FlashAgent
@@ -91,13 +92,42 @@ def main() -> None:
         logger.info("CronJob mode – single scan")
         agent.scan(cfg.scan_query)
     else:
-        logger.info("Continuous mode – scan every %ds", cfg.scan_interval)
+        logger.info(
+            "Continuous mode \u2013 scan every %ds (fast=%ds when health<%d)",
+            cfg.scan_interval, cfg.scan_interval_fast, cfg.scan_health_threshold,
+        )
         while not _shutdown:
+            analysis: Any = None
             try:
-                agent.scan(cfg.scan_query)
+                analysis = agent.scan(cfg.scan_query)
             except Exception as exc:
                 logger.exception("Scan cycle failed: %s", exc)
-            for _ in range(cfg.scan_interval):
+
+            # Adaptive interval: speed up while health is degraded
+            interval = cfg.scan_interval
+            try:
+                if isinstance(analysis, dict):
+                    env_state = analysis.get("environment_state", {}) or {}
+                    health = analysis.get("health", {}) or {}
+                    health_status = env_state.get("health_status", "Healthy")
+                    score = health.get(
+                        "overall_health_score",
+                        env_state.get("overall_health_score", 100),
+                    )
+                    try:
+                        score = int(score)
+                    except (ValueError, TypeError):
+                        score = 100
+                    if health_status != "Healthy" or score < cfg.scan_health_threshold:
+                        interval = cfg.scan_interval_fast
+                        logger.info(
+                            "Adaptive scan: degraded (status=%s score=%s) \u2192 %ds interval",
+                            health_status, score, interval,
+                        )
+            except Exception as exc:
+                logger.debug("Adaptive interval check failed: %s", exc)
+
+            for _ in range(interval):
                 if _shutdown:
                     break
                 time.sleep(1)

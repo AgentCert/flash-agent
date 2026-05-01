@@ -85,15 +85,67 @@ def get_kubernetes_tool_calls(
 def get_prometheus_tool_calls(
     k8s_namespace: str,
 ) -> List[Tuple[str, Dict[str, Any], str]]:
-    """Return the MCP tool call list for Prometheus data collection."""
+    """Return the MCP tool call list for Prometheus snapshot collection.
+
+    Provides per-pod CPU rate, memory working-set, restart count, and pod-phase
+    distribution scoped to the agent's namespace. These metrics are merged with
+    the kubernetes MCP snapshot on every scan so the LLM has time-series signal
+    for fault detection (CPU spikes, memory growth) which kubectl alone cannot
+    reveal between scan cycles.
+    """
+    ns = k8s_namespace
     return [
         ("execute_query", {"query": "up"}, "prometheus_up"),
         (
             "execute_query",
-            {
-                "query": f'count(kube_pod_info{{namespace="{k8s_namespace}"}})'
-            },
+            {"query": f'count(kube_pod_info{{namespace="{ns}"}})'},
             "pod_count",
+        ),
+        # CPU rate per pod (cores), 1-minute window
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!=""}}[1m])'
+                f')'
+            )},
+            "cpu_per_pod",
+        ),
+        # Memory working set per pod (bytes)
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'container_memory_working_set_bytes{{namespace="{ns}",container!=""}}'
+                f')'
+            )},
+            "memory_per_pod",
+        ),
+        # Cumulative container restarts per pod
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'kube_pod_container_status_restarts_total{{namespace="{ns}"}}'
+                f')'
+            )},
+            "restarts_per_pod",
+        ),
+        # Pod-phase distribution
+        (
+            "execute_query",
+            {"query": f'count by (phase) (kube_pod_status_phase{{namespace="{ns}"}})'},
+            "pod_phase_counts",
+        ),
+        # Network receive bytes rate per pod (bytes/sec)
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'rate(container_network_receive_bytes_total{{namespace="{ns}"}}[1m])'
+                f')'
+            )},
+            "network_rx_per_pod",
         ),
     ]
 

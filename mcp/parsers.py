@@ -8,6 +8,7 @@ structured data for agent processing and LLM prompt construction.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List
 
@@ -331,5 +332,128 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
 
             log_summary[pod_name] = pod_info
         summary["pods_log"] = log_summary
+
+    # ── prometheus → CPU/memory/restart top pods ─────────────────────────────
+    prom_data = mcp_data.get("prometheus", {})
+    if isinstance(prom_data, dict) and prom_data:
+        prom_summary = _summarize_prometheus(prom_data)
+        if prom_summary:
+            summary["prometheus"] = prom_summary
+
+    return summary
+
+
+def _parse_prom_instant(raw: Any) -> List[Dict[str, Any]]:
+    """Parse a Prometheus instant-query MCP response into [{labels, value}]."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict) and set(raw.keys()) == {"error"}:
+        return []
+
+    payload: Any = None
+    # Case 1: MCP-wrapped {"content": [{"type":"text","text":"<json>"}]}
+    if isinstance(raw, dict) and "content" in raw:
+        text = extract_mcp_text(raw)
+        if text:
+            try:
+                payload = json.loads(text)
+            except (ValueError, TypeError):
+                return []
+    # Case 2: already a parsed dict (e.g. {"data":{"result":[...]}})
+    elif isinstance(raw, dict):
+        payload = raw
+    # Case 3: a JSON string
+    elif isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    else:
+        return []
+
+    # Unwrap common shapes: {"data":{"result":[...]}} or {"result":[...]}
+    result = None
+    if isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], dict):
+            result = payload["data"].get("result")
+        elif "result" in payload:
+            result = payload.get("result")
+    if not isinstance(result, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for entry in result:
+        if not isinstance(entry, dict):
+            continue
+        metric = entry.get("metric", {}) or {}
+        value = entry.get("value")
+        try:
+            num = float(value[1]) if isinstance(value, (list, tuple)) and len(value) >= 2 else None
+        except (ValueError, TypeError):
+            num = None
+        if num is None:
+            continue
+        out.append({"labels": metric, "value": num})
+    return out
+
+
+def _top_pods(rows: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+    rows_sorted = sorted(rows, key=lambda r: r["value"], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for r in rows_sorted[:limit]:
+        pod = r["labels"].get("pod") or r["labels"].get("instance") or "unknown"
+        out.append({"pod": pod, "value": round(r["value"], 4)})
+    return out
+
+
+def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a compact summary of Prometheus snapshot keyed by result_key."""
+    summary: Dict[str, Any] = {}
+
+    up_rows = _parse_prom_instant(prom_data.get("prometheus_up"))
+    if up_rows:
+        summary["prometheus_up"] = sum(1 for r in up_rows if r["value"] >= 1.0)
+
+    pod_count_rows = _parse_prom_instant(prom_data.get("pod_count"))
+    if pod_count_rows:
+        summary["pod_count"] = int(pod_count_rows[0]["value"])
+
+    cpu_rows = _parse_prom_instant(prom_data.get("cpu_per_pod"))
+    if cpu_rows:
+        summary["cpu_per_pod_top"] = _top_pods(cpu_rows)
+        summary["cpu_high_pods"] = [
+            p for p in summary["cpu_per_pod_top"] if p["value"] > 0.5
+        ]
+
+    mem_rows = _parse_prom_instant(prom_data.get("memory_per_pod"))
+    if mem_rows:
+        # Convert bytes → MB for readability
+        mem_mb = [
+            {"labels": r["labels"], "value": r["value"] / (1024 * 1024)}
+            for r in mem_rows
+        ]
+        summary["memory_per_pod_top_mb"] = _top_pods(mem_mb)
+        summary["memory_high_pods_mb"] = [
+            p for p in summary["memory_per_pod_top_mb"] if p["value"] > 500
+        ]
+
+    restart_rows = _parse_prom_instant(prom_data.get("restarts_per_pod"))
+    if restart_rows:
+        summary["restarts_per_pod_top"] = _top_pods(restart_rows)
+        summary["restarting_pods"] = [
+            p for p in summary["restarts_per_pod_top"] if p["value"] > 0
+        ]
+
+    phase_rows = _parse_prom_instant(prom_data.get("pod_phase_counts"))
+    if phase_rows:
+        phase_counts: Dict[str, int] = {}
+        for r in phase_rows:
+            phase = r["labels"].get("phase", "Unknown")
+            phase_counts[phase] = phase_counts.get(phase, 0) + int(r["value"])
+        summary["pod_phase_counts"] = phase_counts
+
+    net_rows = _parse_prom_instant(prom_data.get("network_rx_per_pod"))
+    if net_rows:
+        summary["network_rx_per_pod_top"] = _top_pods(net_rows)
 
     return summary

@@ -406,6 +406,50 @@ def build_llm_data_payload(
                     + "\n".join(warning_lines[-10:])
                 )
 
+    # ── 2b. Prometheus metrics snapshot ──────────────────────────────────────
+    prom = summary.get("prometheus", {})
+    if prom:
+        prom_lines: List[str] = []
+        if "prometheus_up" in prom:
+            prom_lines.append(f"prometheus_targets_up={prom['prometheus_up']}")
+        if "pod_count" in prom:
+            prom_lines.append(f"pod_count={prom['pod_count']}")
+        if "pod_phase_counts" in prom:
+            prom_lines.append(
+                f"pod_phase_counts={json.dumps(prom['pod_phase_counts'])}"
+            )
+
+        cpu_top = prom.get("cpu_per_pod_top", [])
+        if cpu_top:
+            prom_lines.append("Top CPU pods (cores):")
+            for p in cpu_top[:5]:
+                flag = "  \u26a0\ufe0f >0.5" if p["value"] > 0.5 else ""
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.3f}{flag}")
+
+        mem_top = prom.get("memory_per_pod_top_mb", [])
+        if mem_top:
+            prom_lines.append("Top memory pods (MB):")
+            for p in mem_top[:5]:
+                flag = "  \u26a0\ufe0f >500MB" if p["value"] > 500 else ""
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.1f}{flag}")
+
+        restarting = prom.get("restarting_pods", [])
+        if restarting:
+            prom_lines.append("Pods with restarts (cumulative):")
+            for p in restarting[:5]:
+                prom_lines.append(f"  - {p['pod']}: {int(p['value'])}")
+
+        net_top = prom.get("network_rx_per_pod_top", [])
+        if net_top:
+            prom_lines.append("Top network RX pods (bytes/sec):")
+            for p in net_top[:3]:
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.0f}")
+
+        if prom_lines:
+            sections.append(
+                "## METRICS (Prometheus, last sample)\n" + "\n".join(prom_lines)
+            )
+
     # ── 3. Argo Workflows (sorted newest-first, latest marked) ───────────────
     if include_chaos:
         argo = summary.get("argo_workflows", {})

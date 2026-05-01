@@ -53,9 +53,12 @@ class AgentConfig:
     chaos_namespace: str
     target_app_name: str
     include_chaos_tools: bool
+    enable_prometheus_snapshot: bool  # always-on Prom enrichment in Step 2b
 
     # Scan behaviour
     scan_interval: int
+    scan_interval_fast: int       # used while last scan reported non-Healthy state
+    scan_health_threshold: int    # overall_health_score below this counts as 'fault window'
     scan_query: str
 
     # Experiment identity – injected by sidecar at runtime
@@ -92,7 +95,12 @@ class AgentConfig:
             include_chaos_tools=os.getenv(
                 "MCP_INCLUDE_CHAOS_TOOLS", "false"
             ).lower() in ("true", "1", "yes"),
+            enable_prometheus_snapshot=os.getenv(
+                "ENABLE_PROMETHEUS_SNAPSHOT", "true"
+            ).lower() in ("true", "1", "yes"),
             scan_interval=int(os.getenv("SCAN_INTERVAL", "0")),
+            scan_interval_fast=int(os.getenv("SCAN_INTERVAL_FAST", "15")),
+            scan_health_threshold=int(os.getenv("SCAN_HEALTH_THRESHOLD", "100")),
             scan_query=os.getenv(
                 "SCAN_QUERY",
                 f"Analyse the operational health of all workloads in Kubernetes "

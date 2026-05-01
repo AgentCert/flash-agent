@@ -123,6 +123,26 @@ class FlashAgent:
                 "MCP returned an error \u2013 analysis will reflect degraded data"
             )
 
+        # ── Step 2b: Always augment with Prometheus snapshot when available ──
+        # The kubernetes MCP is the primary source, but Prometheus adds
+        # time-series CPU/memory/restart signal that kubectl alone misses
+        # between scan windows. A failed prom snapshot is non-fatal.
+        # Skip when:
+        #   - PROM_MCP_URL is unset, OR
+        #   - the toggle ENABLE_PROMETHEUS_SNAPSHOT=false, OR
+        #   - LLM already selected the prometheus server (data already present).
+        if (
+            self.cfg.prom_mcp_url
+            and self.cfg.enable_prometheus_snapshot
+            and server_type != "prometheus"
+        ):
+            try:
+                prom_snapshot = self._collect_prometheus_snapshot(scan_id)
+                if prom_snapshot:
+                    mcp_data.setdefault("data", {})["prometheus"] = prom_snapshot
+            except Exception as exc:
+                logger.warning("Prometheus snapshot failed: %s", exc)
+
         # ── Build agent context for Langfuse trace enrichment ────────────────
         _summary = build_mcp_data_summary(mcp_data)
         _pods_info = _summary.get("pods", {})
@@ -469,3 +489,87 @@ class FlashAgent:
         )
 
         return response_payload
+
+    def _collect_prometheus_snapshot(self, scan_id: str = "") -> Dict[str, Any]:
+        """
+        Lightweight Prometheus snapshot used to enrich the kubernetes MCP
+        data with CPU/memory/restart time-series signal.
+
+        Iterates the queries from ``get_prometheus_tool_calls`` and returns
+        a dict keyed by ``result_key``. Per-tool failures are captured as
+        ``{"error": str}`` so a single failed query does not abort the
+        whole snapshot.
+        """
+        if not self.cfg.prom_mcp_url:
+            return {}
+
+        url = self.cfg.prom_mcp_url
+        tool_calls = get_prometheus_tool_calls(self.cfg.k8s_namespace)
+        request_payload: Dict[str, Any] = {
+            "server_type": "prometheus",
+            "namespace": self.cfg.k8s_namespace,
+            "tools": [result_key for _, _, result_key in tool_calls],
+            "tool_count": len(tool_calls),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        logger.info(
+            "Agent \u2192 Prometheus MCP | url=%s | tools=%s",
+            url,
+            [f"{t[0]}\u2192{t[2]}" for t in tool_calls],
+        )
+
+        all_results: Dict[str, Any] = {}
+        t0 = time.time()
+        try:
+            client = MCPClient(url, self.cfg.agent_name, self.cfg.mcp_timeout)
+            client.initialize()
+            for tool_name, tool_args, result_key in tool_calls:
+                try:
+                    result = client.call_tool(tool_name, tool_args)
+                    all_results[result_key] = result
+                    logger.info(
+                        "  Prom tool '%s' [%s] \u2192 %d chars",
+                        tool_name,
+                        result_key,
+                        len(json.dumps(result)),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "  Prom tool '%s' [%s] failed: %s",
+                        tool_name,
+                        result_key,
+                        exc,
+                    )
+                    all_results[result_key] = {"error": str(exc)}
+        except Exception as exc:
+            logger.warning("Prometheus MCP unavailable: %s", exc)
+            return {}
+
+        duration = time.time() - t0
+        response_payload = {
+            "server_type": "prometheus",
+            "namespace": self.cfg.k8s_namespace,
+            "data": all_results,
+            "_mcp_duration_sec": round(duration, 2),
+            "_mcp_data_keys": list(all_results.keys()),
+        }
+        logger.info(
+            "Prometheus MCP \u2192 Agent | %.2fs | tools=%s",
+            duration,
+            list(all_results.keys()),
+        )
+
+        try:
+            persist_mcp_interaction(
+                cfg=self.cfg,
+                server_type="prometheus",
+                request_payload=request_payload,
+                response_payload=response_payload,
+                duration_sec=duration,
+                scan_id=scan_id,
+            )
+        except Exception as exc:
+            logger.debug("persist_mcp_interaction (prom) failed: %s", exc)
+
+        return all_results
