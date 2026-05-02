@@ -9,8 +9,8 @@ IMAGE_TAG ?= latest
 # Full image reference
 IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 
-# Build context - parent directory (Dockerfile expects flash-agent/ paths)
-BUILD_CONTEXT = ..
+# Build context - current directory
+BUILD_CONTEXT = .
 
 .PHONY: help
 help: ## Show this help message

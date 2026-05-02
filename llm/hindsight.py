@@ -198,7 +198,7 @@ class HindsightBuilder:
                 model=self.cfg.model_alias,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=800,
+                max_completion_tokens=800,
             )
             
             hindsight = response.choices[0].message.content

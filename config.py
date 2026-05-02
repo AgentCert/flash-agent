@@ -40,8 +40,7 @@ class AgentConfig:
     mcp_urls: list[str]
     mcp_timeout: int
 
-    # Scan behaviour
-    scan_interval: int
+    # Scan query
     scan_query: str
 
     @classmethod
@@ -61,7 +60,6 @@ class AgentConfig:
             azure_api_version=os.getenv("AZURE_API_VERSION", "2025-04-01-preview"),
             mcp_urls=mcp_urls,
             mcp_timeout=int(os.getenv("MCP_TIMEOUT", "30")),
-            scan_interval=int(os.getenv("SCAN_INTERVAL", "0")),
             scan_query=os.getenv(
                 "SCAN_QUERY",
                 "Analyse the data from MCP tools and provide insights.",
