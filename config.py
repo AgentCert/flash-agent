@@ -43,6 +43,10 @@ class AgentConfig:
     # Scan query
     scan_query: str
 
+    # Optional explicit scope override — when set, skips MCP scope discovery
+    # and forces the agent to operate within this namespace. Empty = auto-discover.
+    scope_override: str
+
     @classmethod
     def from_env(cls) -> AgentConfig:
         """Create configuration from environment variables."""
@@ -64,6 +68,7 @@ class AgentConfig:
                 "SCAN_QUERY",
                 "Analyse the data from MCP tools and provide insights.",
             ),
+            scope_override=os.getenv("AGENT_SCOPE_NAMESPACE", "").strip(),
         )
 
     def validate(self) -> list[str]:

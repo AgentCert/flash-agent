@@ -10,12 +10,181 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+import re
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import urlparse
 
 import requests
 
 logger = logging.getLogger("flash-agent")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scope model
+# ─────────────────────────────────────────────────────────────────────────────
+
+ScopeKind = Literal["namespace", "namespaces", "cluster", "agnostic", "unknown"]
+
+
+@dataclass
+class MCPScope:
+    """
+    What an MCP server is authorized to read.
+
+    The agent uses this to constrain LLM tool calls. ``namespace`` is the
+    common case; ``agnostic`` covers MCPs without a namespace concept (e.g.
+    Prometheus); ``unknown`` is an honest "discovery failed" state.
+    """
+
+    kind: ScopeKind = "unknown"
+    namespaces: List[str] = field(default_factory=list)
+    source: str = ""  # "explicit" | "introspection" | "probe" | "fallback" | "merged"
+
+    def describe(self) -> str:
+        if self.kind == "namespace" and self.namespaces:
+            return f"namespace='{self.namespaces[0]}' (source={self.source})"
+        if self.kind == "namespaces":
+            return f"namespaces={self.namespaces} (source={self.source})"
+        return f"{self.kind} (source={self.source})"
+
+
+# Heuristic patterns for picking the introspection / probe tools.
+# Generic across MCP implementations — no specific tool names hardcoded.
+_INTROSPECTION_NAME_PATTERN = re.compile(
+    r"(configuration|context|whoami|server[_-]?info|config[_-]?view|identity)",
+    re.IGNORECASE,
+)
+_PROBE_NAME_PATTERN = re.compile(
+    r"(pods|events|deployments|services|configmaps).*(list|get)",
+    re.IGNORECASE,
+)
+_NS_REGEX = re.compile(
+    r"namespace[\"'\s]*[:=]\s*[\"']?([a-z0-9][a-z0-9-]{0,62})[\"']?",
+    re.IGNORECASE,
+)
+_IN_NS_REGEX = re.compile(
+    r"in\s+(?:the\s+)?namespace\s+[\"']?([a-z0-9][a-z0-9-]{0,62})[\"']?",
+    re.IGNORECASE,
+)
+_NS_KEY_NAMES = {"namespace", "currentnamespace", "default_namespace", "default-namespace"}
+
+
+def _tool_props(tool: Dict[str, Any]) -> Dict[str, Any]:
+    return tool.get("inputSchema", {}).get("properties", {}) or {}
+
+
+def _tool_required(tool: Dict[str, Any]) -> List[str]:
+    return tool.get("inputSchema", {}).get("required", []) or []
+
+
+def _any_tool_has_namespace_param(tools: List[Dict[str, Any]]) -> bool:
+    return any("namespace" in _tool_props(t) for t in tools)
+
+
+def _pick_introspection_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for t in tools:
+        name = t.get("name", "")
+        if _INTROSPECTION_NAME_PATTERN.search(name) and not _tool_required(t):
+            return t
+    return None
+
+
+def _pick_probe_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Pick a read-shaped tool whose only required arg (if any) is ``namespace``.
+    Used as a Tier-2 fallback to probe scope from a successful response.
+    """
+    for t in tools:
+        name = t.get("name", "")
+        if "namespace" not in _tool_props(t):
+            continue
+        if not _PROBE_NAME_PATTERN.search(name):
+            continue
+        required = set(_tool_required(t))
+        if required and not required.issubset({"namespace"}):
+            continue
+        return t
+    return None
+
+
+def _extract_text(result: Dict[str, Any]) -> str:
+    """Pull text content out of a standard MCP tool response."""
+    if not isinstance(result, dict):
+        return str(result or "")
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = [
+            c.get("text", "")
+            for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+        ]
+        if parts:
+            return "\n".join(parts)
+    return json.dumps(result, default=str)
+
+
+def _walk_json_for_namespace(data: Any) -> List[str]:
+    """Walk a JSON-shaped value and collect all string values under namespace-like keys."""
+    found: List[str] = []
+
+    def visit(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k.lower() in _NS_KEY_NAMES and isinstance(v, str):
+                    found.append(v)
+                visit(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                visit(item)
+
+    visit(data)
+    return found
+
+
+def _regex_extract_namespace(text: str) -> Optional[str]:
+    """Permissive regex fallback. Prefers non-'default' matches when both exist."""
+    candidates: List[str] = []
+    for pat in (_NS_REGEX, _IN_NS_REGEX):
+        candidates.extend(pat.findall(text or ""))
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return None
+    non_default = [c for c in candidates if c != "default"]
+    pool = non_default if non_default else candidates
+    return Counter(pool).most_common(1)[0][0]
+
+
+def _parse_namespace_from_result(result: Dict[str, Any]) -> Optional[Union[str, List[str]]]:
+    """
+    Read a namespace (or list of namespaces) out of an MCP tool result.
+
+    Returns ``None`` for error responses or when nothing namespace-shaped is
+    present. We deliberately don't trust namespaces extracted from error
+    messages here — those often reflect the *attempted* namespace (e.g.
+    ``default``), not the SA's authorized scope.
+    """
+    if not result or "error" in result:
+        return None
+
+    text = _extract_text(result)
+    if not text:
+        return None
+
+    # Try JSON parse first (introspection tools commonly return JSON or kubeconfig)
+    try:
+        data = json.loads(text)
+        found = _walk_json_for_namespace(data)
+        if found:
+            distinct = list(dict.fromkeys(found))
+            return distinct if len(distinct) > 1 else distinct[0]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fall back to regex (handles YAML / free-form text)
+    ns = _regex_extract_namespace(text)
+    return ns
 
 
 class MCPClient:
@@ -68,7 +237,7 @@ class MCPClient:
     def list_tools(self) -> list[Dict[str, Any]]:
         """
         Discover available tools from the MCP server.
-        
+
         Returns a list of tool definitions with name, description, and inputSchema.
         """
         self._call_counter += 1
@@ -77,6 +246,64 @@ class MCPClient:
             params={},
         )
         return result.get("tools", [])
+
+    def discover_scope(
+        self,
+        tool_defs: List[Dict[str, Any]],
+        override: Optional[str] = None,
+    ) -> MCPScope:
+        """
+        Discover what this MCP server is authorized to read.
+
+        Order of resolution:
+          0. Explicit ``override`` wins — operator awareness lever.
+          1. If no tool exposes a ``namespace`` parameter, the server is
+             scope-agnostic (e.g. Prometheus). Return early.
+          2. Try an introspection-style tool (``configuration_view``,
+             ``server_info``, etc.) and parse its result for a namespace.
+          3. Try a read-shaped probe tool with empty args; trust the
+             result only on success (error messages can name the
+             *attempted* namespace, not the authorized one).
+          4. Give up cleanly — return ``unknown``.
+        """
+        if override:
+            return MCPScope(kind="namespace", namespaces=[override], source="explicit")
+
+        if not _any_tool_has_namespace_param(tool_defs):
+            return MCPScope(kind="agnostic", source="introspection")
+
+        # Tier 1: introspection
+        introspection = _pick_introspection_tool(tool_defs)
+        if introspection:
+            tool_name = introspection.get("name", "")
+            try:
+                result = self.call_tool(tool_name, {})
+                ns = _parse_namespace_from_result(result)
+                if ns:
+                    if isinstance(ns, list):
+                        kind: ScopeKind = "namespaces" if len(ns) > 1 else "namespace"
+                        return MCPScope(kind=kind, namespaces=ns, source="introspection")
+                    return MCPScope(kind="namespace", namespaces=[ns], source="introspection")
+            except Exception as exc:
+                logger.debug("Introspection tool %s failed: %s", tool_name, exc)
+
+        # Tier 2: probe — trust successful responses only
+        probe = _pick_probe_tool(tool_defs)
+        if probe:
+            tool_name = probe.get("name", "")
+            try:
+                result = self.call_tool(tool_name, {})
+                if "error" not in (result or {}):
+                    ns = _parse_namespace_from_result(result)
+                    if ns:
+                        if isinstance(ns, list):
+                            kind = "namespaces" if len(ns) > 1 else "namespace"
+                            return MCPScope(kind=kind, namespaces=ns, source="probe")
+                        return MCPScope(kind="namespace", namespaces=[ns], source="probe")
+            except Exception as exc:
+                logger.debug("Probe tool %s failed: %s", tool_name, exc)
+
+        return MCPScope(kind="unknown", source="fallback")
 
     def _jsonrpc_call(
         self,

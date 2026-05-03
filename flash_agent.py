@@ -24,7 +24,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,7 +40,7 @@ from llm.utils import (
     format_analysis_for_history,
     trim_history_to_token_limit,
 )
-from mcp.client import MCPClient
+from mcp.client import MCPClient, MCPScope
 
 logger = logging.getLogger("flash-agent")
 
@@ -49,23 +48,84 @@ logger = logging.getLogger("flash-agent")
 MAX_TOOL_ITERATIONS = 10
 
 
-SYSTEM_PROMPT = """You are an ITOps analysis agent with access to Kubernetes cluster tools.
+def _build_system_prompt(scope: MCPScope) -> str:
+    """
+    Build a scope-aware system prompt from a discovered :class:`MCPScope`.
 
-Your task is to analyze the health and status of a Kubernetes cluster by:
+    The scope kind drives which constraints the LLM sees:
+      - ``namespace``  → strict single-ns prompt (most common case)
+      - ``namespaces`` → multi-ns prompt; LLM must pass explicit ``namespace=``
+      - ``cluster``    → cluster-wide read is permitted
+      - ``agnostic``/``unknown`` → soft fallback; prefer namespace-scoped tools
+                                   but don't claim authority we haven't verified
+    """
+    if scope.kind == "namespace" and scope.namespaces:
+        ns = scope.namespaces[0]
+        scope_block = (
+            f"## Your Scope\n"
+            f"You operate inside a single Kubernetes namespace: **`{ns}`**.\n"
+            f"The MCP server backing your tools is bound by RBAC to this namespace only.\n"
+            f"You MUST stay within this scope:\n"
+            f"- Always pass `namespace=\"{ns}\"` to any tool that accepts a `namespace` argument.\n"
+            f"- Prefer namespace-scoped tool variants (commonly suffixed `_in_namespace`, or any tool whose schema declares a `namespace` parameter).\n"
+            f"- Do NOT call cluster-scoped tools — they will fail with RBAC `forbidden`:\n"
+            f"  - `namespaces_list` (cluster-scoped resource)\n"
+            f"  - `pods_list`, `events_list` without a namespace argument (defaults to `default`, which you cannot read)\n"
+            f"  - `nodes_top`, `nodes_*` (cluster-scoped; metrics API may also be unavailable)\n"
+            f"- For Prometheus-style queries, pin `{{namespace=\"{ns}\"}}` selectors.\n"
+            f"- If a tool returns `forbidden` or `not available`, do NOT retry it. Record it as an observability gap and continue with tools that work.\n"
+        )
+    elif scope.kind == "namespaces" and scope.namespaces:
+        ns_list = ", ".join(f"`{n}`" for n in scope.namespaces)
+        scope_block = (
+            f"## Your Scope\n"
+            f"You may operate across these Kubernetes namespaces: {ns_list}.\n"
+            f"The MCP server's RBAC allows access to each of these — but NO others.\n"
+            f"You MUST:\n"
+            f"- Pass an explicit `namespace=...` argument on every tool call (one of the namespaces above).\n"
+            f"- Prefer namespace-scoped tool variants. Do NOT call `namespaces_list`, `pods_list` (cluster-wide), or `nodes_top`.\n"
+            f"- For Prometheus-style queries, pin `{{namespace=~\"{('|'.join(scope.namespaces))}\"}}` selectors.\n"
+            f"- If a tool returns `forbidden` or `not available`, do NOT retry it; record it as an observability gap.\n"
+        )
+    elif scope.kind == "cluster":
+        scope_block = (
+            "## Your Scope\n"
+            "The MCP server has cluster-wide RBAC. You may use cluster-scoped tools "
+            "(`pods_list`, `namespaces_list`, `nodes_top`) and namespace-scoped tools alike.\n"
+            "Still, prefer narrow queries when investigating a specific component to keep results actionable.\n"
+            "If a tool returns `not available` (e.g. metrics API), record it as an observability gap.\n"
+        )
+    else:
+        # agnostic or unknown
+        scope_block = (
+            "## Your Scope\n"
+            "Target scope could not be auto-discovered from the MCP server.\n"
+            "Prefer namespace-scoped tools (any tool whose schema declares a `namespace` parameter).\n"
+            "Avoid cluster-scoped calls (`namespaces_list`, `nodes_top`) unless you have evidence the MCP service account is authorized cluster-wide.\n"
+            "If a tool returns `forbidden` or `not available`, do NOT retry it; record it as an observability gap.\n"
+        )
+
+    return _SYSTEM_PROMPT_HEAD + scope_block + _SYSTEM_PROMPT_TAIL
+
+
+_SYSTEM_PROMPT_HEAD = """You are an ITOps analysis agent with access to Kubernetes tools via MCP.
+
+Your task is to analyze the health of your assigned Kubernetes scope by:
 1. Using the available tools to gather information
 2. Investigating any issues you discover
 3. Producing a final structured analysis
 
+"""
+
+_SYSTEM_PROMPT_TAIL = """
 ## Tool Usage Guidelines
-- Start with broad discovery tools like `pods_list`, `events_list`, `namespaces_list`
-- If you see issues, drill down with specific tools like `pods_log` or `pods_get`
-- Use `pods_log` with specific pod names to investigate container issues
-- Not all tools require arguments - check the schema
-- Try `pods_top` and `nodes_top` to check resource utilization
+- After identifying problem pods, drill down with `pods_log` and `pods_get`.
+- Try `pods_top` (within your namespace) to check pod-level resource utilization.
+- Not all tools require arguments — inspect each tool's schema.
 
 ## CRITICAL: Observability Gap Detection
-You MUST attempt to gather resource metrics (CPU/memory) via `pods_top` or `nodes_top`.
-If these fail with "metrics API not available" or similar errors:
+You MUST attempt to gather resource metrics (CPU/memory) via `pods_top` (namespace-scoped).
+If it fails with "metrics API not available" or similar errors:
 
 1. **Report this as a WARNING issue** - this is a significant observability gap
 2. **Explicitly state the limitations** in your analysis:
@@ -318,30 +378,50 @@ class FlashAgent:
         # ── Record query in history ──────────────────────────────────────────
         self._add_to_history("user", f"Query: {scan_query}", {"scan_id": scan_id})
 
-        # ── Step 1: Discover MCP tools ───────────────────────────────────────
-        mcp_tools, mcp_clients = self._discover_mcp_tools()
-        
+        # ── Step 1: Discover MCP tools + scope ───────────────────────────────
+        mcp_tools, mcp_clients, mcp_scopes = self._discover_mcp_tools()
+
         if not mcp_tools:
             logger.error("No MCP tools discovered – cannot proceed")
             return {"health": {"overall_health_score": -1}, "issues": []}
-        
+
         # Convert to OpenAI function format
         openai_tools = [_convert_mcp_tool_to_openai(t) for t in mcp_tools]
         tool_names = [t["function"]["name"] for t in openai_tools]
         logger.info("Discovered %d tools: %s", len(openai_tools), tool_names)
 
+        # Merge per-MCP scopes into the single scope shown to the LLM.
+        merged_scope = self._merge_scopes(list(mcp_scopes.values()))
+        logger.info("Discovered scope: %s", merged_scope.describe())
+
         # ── Step 2: Initialize LLM conversation ──────────────────────────────
         client = _create_openai_client(self.cfg)
-        
+        system_prompt = _build_system_prompt(merged_scope)
+
         # Build initial prompt with optional hindsight
         hindsight = self._get_hindsight_for_prompt(scan_id)
-        user_prompt = f"Analyze the Kubernetes cluster health. Task: {scan_query}"
+        if merged_scope.kind == "namespace" and merged_scope.namespaces:
+            user_prompt = (
+                f"Analyze the health of namespace `{merged_scope.namespaces[0]}` "
+                f"using only namespace-scoped tools. Task: {scan_query}"
+            )
+        elif merged_scope.kind == "namespaces" and merged_scope.namespaces:
+            ns_csv = ", ".join(merged_scope.namespaces)
+            user_prompt = (
+                f"Analyze the health of namespaces [{ns_csv}] "
+                f"using namespace-scoped tools (always pass an explicit `namespace=`). "
+                f"Task: {scan_query}"
+            )
+        elif merged_scope.kind == "cluster":
+            user_prompt = f"Analyze the Kubernetes cluster health. Task: {scan_query}"
+        else:
+            user_prompt = f"Analyze the Kubernetes namespace health. Task: {scan_query}"
         if hindsight:
             user_prompt = f"{user_prompt}\n\nHINDSIGHT FROM PREVIOUS ANALYSIS:\n{hindsight}"
             logger.info("Injected hindsight into prompt (%d chars)", len(hindsight))
-        
+
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         
@@ -480,34 +560,85 @@ class FlashAgent:
 
         return analysis
 
-    def _discover_mcp_tools(self) -> Tuple[List[Dict[str, Any]], Dict[str, MCPClient]]:
+    def _merge_scopes(self, scopes: List[MCPScope]) -> MCPScope:
         """
-        Discover available tools from all MCP servers.
-        
+        Merge per-MCP scopes into the single scope shown to the LLM.
+
+        Rules:
+          - Drop ``agnostic`` scopes (e.g. Prometheus) — they don't constrain.
+          - If everything left is ``unknown``, return ``unknown`` honestly.
+          - If any concrete namespace scope exists, the union of namespaces
+            wins (least-privilege wins over any cluster-wide peer).
+          - Otherwise, ``cluster``.
+        """
+        if not scopes:
+            return MCPScope(kind="unknown", source="fallback")
+
+        non_agnostic = [s for s in scopes if s.kind != "agnostic"]
+        if not non_agnostic:
+            return MCPScope(kind="unknown", source="fallback (all-agnostic)")
+
+        known = [s for s in non_agnostic if s.kind != "unknown"]
+        if not known:
+            return MCPScope(kind="unknown", source="fallback (all-unknown)")
+
+        ns_scopes = [s for s in known if s.kind in ("namespace", "namespaces")]
+        if ns_scopes:
+            collected: List[str] = []
+            for s in ns_scopes:
+                collected.extend(s.namespaces)
+            distinct = list(dict.fromkeys(collected))  # order-preserving dedupe
+            kind: str = "namespace" if len(distinct) == 1 else "namespaces"
+            return MCPScope(kind=kind, namespaces=distinct, source="merged")
+
+        # Only cluster-scoped MCPs known
+        return MCPScope(kind="cluster", source="merged")
+
+    def _discover_mcp_tools(
+        self,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, MCPClient], Dict[str, MCPScope]]:
+        """
+        Discover tools and scope from each configured MCP server.
+
+        Scope discovery uses the MCP server itself as the authority (via its
+        introspection / probe tools), never the URL or any deployment-shape
+        signal. ``cfg.scope_override`` short-circuits discovery when set.
+
         Returns:
-            Tuple of (all_tool_definitions, {mcp_url: client})
+            ``(all_tool_definitions, {url: client}, {url: scope})``.
         """
         all_tools: List[Dict[str, Any]] = []
         clients: Dict[str, MCPClient] = {}
-        
+        scopes: Dict[str, MCPScope] = {}
+        override = self.cfg.scope_override or None
+
         for mcp_url in self.cfg.mcp_urls:
             logger.info("Discovering tools from %s", mcp_url)
             try:
                 client = MCPClient(mcp_url, self.cfg.agent_name, self.cfg.mcp_timeout)
                 session_id = client.initialize()
                 logger.info("MCP session: %s", session_id)
-                
+
                 tools = client.list_tools()
                 for tool in tools:
                     tool["_mcp_url"] = mcp_url  # Track which server has this tool
                 all_tools.extend(tools)
                 clients[mcp_url] = client
-                
+
+                # Discover this MCP's authorization scope from the server itself.
+                try:
+                    scope = client.discover_scope(tools, override=override)
+                except Exception as exc:
+                    logger.warning("Scope discovery failed for %s: %s", mcp_url, exc)
+                    scope = MCPScope(kind="unknown", source="fallback (error)")
+                scopes[mcp_url] = scope
+                logger.info("MCP %s → %s", mcp_url, scope.describe())
+
                 logger.info("Found %d tools from %s", len(tools), mcp_url)
             except Exception as exc:
                 logger.error("Failed to discover tools from %s: %s", mcp_url, exc)
-        
-        return all_tools, clients
+
+        return all_tools, clients, scopes
 
     def _execute_mcp_tool(
         self,
@@ -644,9 +775,10 @@ class FlashAgent:
             WatchBaseline with selected tools and initial metrics
         """
         logger.info("Establishing watch baseline for namespace: %s", namespace)
-        
-        # Discover available MCP tools
-        mcp_tools, mcp_clients = self._discover_mcp_tools()
+
+        # Discover available MCP tools (scope info ignored — namespace is given
+        # explicitly by the caller in watch mode).
+        mcp_tools, mcp_clients, _ = self._discover_mcp_tools()
         if not mcp_tools:
             raise RuntimeError("No MCP tools discovered - cannot establish baseline")
         
@@ -734,7 +866,7 @@ class FlashAgent:
             baseline.namespace, poll_interval, len(baseline.watch_tools),
         )
         
-        mcp_tools, mcp_clients = self._discover_mcp_tools()
+        mcp_tools, mcp_clients, _ = self._discover_mcp_tools()
         if not mcp_clients:
             logger.error("No MCP clients available for watch")
             return
