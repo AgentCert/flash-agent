@@ -70,6 +70,13 @@ _IN_NS_REGEX = re.compile(
 )
 _NS_KEY_NAMES = {"namespace", "currentnamespace", "default_namespace", "default-namespace"}
 
+# Captures the SA's home namespace from "system:serviceaccount:<ns>:<name>".
+# This is the SA's *home* — almost always equal to its RBAC scope when the
+# Role/RoleBinding are co-located with the SA (the standard MCP deployment
+# shape). Distinct from the *attempted* namespace named in the same error
+# (e.g. `... in the namespace "default"`), which we do not trust.
+_SA_NS_REGEX = re.compile(r"system:serviceaccount:([a-z0-9][a-z0-9-]{0,62}):")
+
 
 def _tool_props(tool: Dict[str, Any]) -> Dict[str, Any]:
     return tool.get("inputSchema", {}).get("properties", {}) or {}
@@ -91,22 +98,71 @@ def _pick_introspection_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, 
     return None
 
 
-def _pick_probe_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _pick_validation_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    Pick a read-shaped tool whose only required arg (if any) is ``namespace``.
-    Used as a Tier-2 fallback to probe scope from a successful response.
+    Pick a read-shaped tool that *requires* a ``namespace`` arg.
+
+    Used to validate a candidate namespace via a real read against it. The tool
+    must take ``namespace`` so we can target a specific candidate; required
+    must be a subset of ``{namespace}`` so we can call it with just the candidate.
     """
     for t in tools:
         name = t.get("name", "")
-        if "namespace" not in _tool_props(t):
+        props = _tool_props(t)
+        if "namespace" not in props:
             continue
         if not _PROBE_NAME_PATTERN.search(name):
             continue
         required = set(_tool_required(t))
-        if required and not required.issubset({"namespace"}):
+        if "namespace" not in required:
+            continue
+        if not required.issubset({"namespace"}):
             continue
         return t
     return None
+
+
+def _pick_candidate_probe_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Pick a read-shaped tool with no required args.
+
+    Used to provoke a response we can mine for a candidate namespace:
+      - SUCCESS  → SA has cluster-wide read (we'll classify as ``cluster``)
+      - FORBIDDEN → error names ``system:serviceaccount:<ns>:`` (the SA's home ns)
+    """
+    for t in tools:
+        name = t.get("name", "")
+        if not _PROBE_NAME_PATTERN.search(name):
+            continue
+        if _tool_required(t):
+            continue
+        return t
+    return None
+
+
+def _is_error(result: Dict[str, Any]) -> bool:
+    """
+    Return True if an MCP tool result represents an error.
+
+    Handles both shapes:
+      - JSON-RPC level: top-level ``error`` key (set by ``_jsonrpc_call`` on protocol errors)
+      - MCP tool level: ``isError: true`` flag inside a successful JSON-RPC result
+    """
+    if not isinstance(result, dict):
+        return True
+    if "error" in result:
+        return True
+    if result.get("isError") is True:
+        return True
+    return False
+
+
+def _extract_sa_namespace_from_error(text: str) -> Optional[str]:
+    """Extract <ns> from `system:serviceaccount:<ns>:<name>` if present."""
+    if not text:
+        return None
+    m = _SA_NS_REGEX.search(text)
+    return m.group(1) if m else None
 
 
 def _extract_text(result: Dict[str, Any]) -> str:
@@ -165,7 +221,7 @@ def _parse_namespace_from_result(result: Dict[str, Any]) -> Optional[Union[str, 
     messages here — those often reflect the *attempted* namespace (e.g.
     ``default``), not the SA's authorized scope.
     """
-    if not result or "error" in result:
+    if not result or _is_error(result):
         return None
 
     text = _extract_text(result)
@@ -255,16 +311,29 @@ class MCPClient:
         """
         Discover what this MCP server is authorized to read.
 
-        Order of resolution:
-          0. Explicit ``override`` wins — operator awareness lever.
-          1. If no tool exposes a ``namespace`` parameter, the server is
-             scope-agnostic (e.g. Prometheus). Return early.
-          2. Try an introspection-style tool (``configuration_view``,
-             ``server_info``, etc.) and parse its result for a namespace.
-          3. Try a read-shaped probe tool with empty args; trust the
-             result only on success (error messages can name the
-             *attempted* namespace, not the authorized one).
-          4. Give up cleanly — return ``unknown``.
+        Resolution:
+          0. ``override`` wins — operator awareness lever.
+          1. No tool exposes a ``namespace`` parameter → ``agnostic``
+             (e.g. Prometheus, inherits scope from peers at merge time).
+          2. Collect candidate namespaces:
+             - From an introspection tool (``configuration_view``, etc.) —
+               useful when an MCP exposes its config.
+             - From a candidate-probe call (a read tool with no required args).
+               If it SUCCEEDS, the SA has cluster-wide read → return ``cluster``.
+               If it FAILS with a forbidden RBAC error, mine the SA's home
+               namespace from ``system:serviceaccount:<ns>:`` — that name
+               (almost always equal to the SA's RBAC scope in standard
+               co-located Role/RoleBinding deployments) becomes a candidate.
+          3. Validate each candidate via a namespace-required read tool
+             (e.g. ``pods_list_in_namespace``). Adopt only the namespaces
+             that return non-error responses.
+          4. No validated candidate → ``unknown``.
+
+        Notes:
+          - Error responses are recognised in BOTH MCP shapes: top-level
+            ``error`` (JSON-RPC) and ``isError: true`` (MCP tool-level).
+          - We never adopt a namespace from string-matching alone; adoption
+            requires either an explicit override or a successful probe.
         """
         if override:
             return MCPScope(kind="namespace", namespaces=[override], source="explicit")
@@ -272,36 +341,59 @@ class MCPClient:
         if not _any_tool_has_namespace_param(tool_defs):
             return MCPScope(kind="agnostic", source="introspection")
 
-        # Tier 1: introspection
+        candidates: List[str] = []
+
+        # Tier 1: introspection — collect candidates only.
         introspection = _pick_introspection_tool(tool_defs)
         if introspection:
             tool_name = introspection.get("name", "")
             try:
                 result = self.call_tool(tool_name, {})
                 ns = _parse_namespace_from_result(result)
-                if ns:
-                    if isinstance(ns, list):
-                        kind: ScopeKind = "namespaces" if len(ns) > 1 else "namespace"
-                        return MCPScope(kind=kind, namespaces=ns, source="introspection")
-                    return MCPScope(kind="namespace", namespaces=[ns], source="introspection")
+                if isinstance(ns, list):
+                    candidates.extend(ns)
+                elif ns:
+                    candidates.append(ns)
             except Exception as exc:
                 logger.debug("Introspection tool %s failed: %s", tool_name, exc)
 
-        # Tier 2: probe — trust successful responses only
-        probe = _pick_probe_tool(tool_defs)
-        if probe:
-            tool_name = probe.get("name", "")
+        # Tier 2: candidate-probe (no required args).
+        cand_probe = _pick_candidate_probe_tool(tool_defs)
+        if cand_probe:
+            tool_name = cand_probe.get("name", "")
             try:
                 result = self.call_tool(tool_name, {})
-                if "error" not in (result or {}):
-                    ns = _parse_namespace_from_result(result)
-                    if ns:
-                        if isinstance(ns, list):
-                            kind = "namespaces" if len(ns) > 1 else "namespace"
-                            return MCPScope(kind=kind, namespaces=ns, source="probe")
-                        return MCPScope(kind="namespace", namespaces=[ns], source="probe")
+                if not _is_error(result):
+                    # SA has cluster-wide read on this resource — treat as cluster scope.
+                    return MCPScope(kind="cluster", source="probe")
+                # Forbidden response — mine the SA's home ns from the error.
+                sa_ns = _extract_sa_namespace_from_error(_extract_text(result))
+                if sa_ns and sa_ns not in candidates:
+                    candidates.append(sa_ns)
             except Exception as exc:
-                logger.debug("Probe tool %s failed: %s", tool_name, exc)
+                logger.debug("Candidate probe %s failed: %s", tool_name, exc)
+
+        # Tier 3: validate each candidate via a namespace-required read.
+        validator = _pick_validation_tool(tool_defs)
+        if validator and candidates:
+            tool_name = validator.get("name", "")
+            validated: List[str] = []
+            for ns in dict.fromkeys(candidates):  # ordered dedupe
+                try:
+                    result = self.call_tool(tool_name, {"namespace": ns})
+                    if not _is_error(result):
+                        validated.append(ns)
+                    else:
+                        # A failure here may also reveal the SA's home ns —
+                        # capture it for the next iteration.
+                        sa_ns = _extract_sa_namespace_from_error(_extract_text(result))
+                        if sa_ns and sa_ns not in candidates and sa_ns != ns:
+                            candidates.append(sa_ns)
+                except Exception as exc:
+                    logger.debug("Validation %s(ns=%s) failed: %s", tool_name, ns, exc)
+            if validated:
+                kind: ScopeKind = "namespaces" if len(validated) > 1 else "namespace"
+                return MCPScope(kind=kind, namespaces=validated, source="probe")
 
         return MCPScope(kind="unknown", source="fallback")
 
