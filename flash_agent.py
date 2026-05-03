@@ -48,107 +48,15 @@ logger = logging.getLogger("flash-agent")
 MAX_TOOL_ITERATIONS = 10
 
 
-def _build_system_prompt(scope: MCPScope) -> str:
-    """
-    Build a scope-aware system prompt from a discovered :class:`MCPScope`.
-
-    The scope kind drives which constraints the LLM sees:
-      - ``namespace``  → strict single-ns prompt (most common case)
-      - ``namespaces`` → multi-ns prompt; LLM must pass explicit ``namespace=``
-      - ``cluster``    → cluster-wide read is permitted
-      - ``agnostic``/``unknown`` → soft fallback; prefer namespace-scoped tools
-                                   but don't claim authority we haven't verified
-    """
-    if scope.kind == "namespace" and scope.namespaces:
-        ns = scope.namespaces[0]
-        scope_block = (
-            f"## Your Scope\n"
-            f"You operate inside a single Kubernetes namespace: **`{ns}`**.\n"
-            f"The MCP server backing your tools is bound by RBAC to this namespace only.\n"
-            f"You MUST stay within this scope:\n"
-            f"- Always pass `namespace=\"{ns}\"` to any tool that accepts a `namespace` argument.\n"
-            f"- Prefer namespace-scoped tool variants (commonly suffixed `_in_namespace`, or any tool whose schema declares a `namespace` parameter).\n"
-            f"- Do NOT call cluster-scoped tools — they will fail with RBAC `forbidden`:\n"
-            f"  - `namespaces_list` (cluster-scoped resource)\n"
-            f"  - `pods_list`, `events_list` without a namespace argument (defaults to `default`, which you cannot read)\n"
-            f"  - `nodes_top`, `nodes_*` (cluster-scoped; metrics API may also be unavailable)\n"
-            f"- For Prometheus-style queries, pin `{{namespace=\"{ns}\"}}` selectors.\n"
-            f"- If a tool returns `forbidden` or `not available`, do NOT retry it. Record it as an observability gap and continue with tools that work.\n"
-        )
-    elif scope.kind == "namespaces" and scope.namespaces:
-        ns_list = ", ".join(f"`{n}`" for n in scope.namespaces)
-        scope_block = (
-            f"## Your Scope\n"
-            f"You may operate across these Kubernetes namespaces: {ns_list}.\n"
-            f"The MCP server's RBAC allows access to each of these — but NO others.\n"
-            f"You MUST:\n"
-            f"- Pass an explicit `namespace=...` argument on every tool call (one of the namespaces above).\n"
-            f"- Prefer namespace-scoped tool variants. Do NOT call `namespaces_list`, `pods_list` (cluster-wide), or `nodes_top`.\n"
-            f"- For Prometheus-style queries, pin `{{namespace=~\"{('|'.join(scope.namespaces))}\"}}` selectors.\n"
-            f"- If a tool returns `forbidden` or `not available`, do NOT retry it; record it as an observability gap.\n"
-        )
-    elif scope.kind == "cluster":
-        scope_block = (
-            "## Your Scope\n"
-            "The MCP server has cluster-wide RBAC. You may use cluster-scoped tools "
-            "(`pods_list`, `namespaces_list`, `nodes_top`) and namespace-scoped tools alike.\n"
-            "Still, prefer narrow queries when investigating a specific component to keep results actionable.\n"
-            "If a tool returns `not available` (e.g. metrics API), record it as an observability gap.\n"
-        )
-    else:
-        # agnostic or unknown
-        scope_block = (
-            "## Your Scope\n"
-            "Target scope could not be auto-discovered from the MCP server.\n"
-            "Prefer namespace-scoped tools (any tool whose schema declares a `namespace` parameter).\n"
-            "Avoid cluster-scoped calls (`namespaces_list`, `nodes_top`) unless you have evidence the MCP service account is authorized cluster-wide.\n"
-            "If a tool returns `forbidden` or `not available`, do NOT retry it; record it as an observability gap.\n"
-        )
-
-    return _SYSTEM_PROMPT_HEAD + scope_block + _SYSTEM_PROMPT_TAIL
-
-
 _SYSTEM_PROMPT_HEAD = """You are an ITOps analysis agent with access to Kubernetes tools via MCP.
 
 Your task is to analyze the health of your assigned Kubernetes scope by:
 1. Using the available tools to gather information
 2. Investigating any issues you discover
-3. Producing a final structured analysis
+3. Producing a final structured analysis"""
 
-"""
 
-_SYSTEM_PROMPT_TAIL = """
-## Tool Usage Guidelines
-- After identifying problem pods, drill down with `pods_log` and `pods_get`.
-- Try `pods_top` (within your namespace) to check pod-level resource utilization.
-- Not all tools require arguments — inspect each tool's schema.
-
-## CRITICAL: Observability Gap Detection
-You MUST attempt to gather resource metrics (CPU/memory) via `pods_top` (namespace-scoped).
-If it fails with "metrics API not available" or similar errors:
-
-1. **Report this as a WARNING issue** - this is a significant observability gap
-2. **Explicitly state the limitations** in your analysis:
-   - Cannot detect CPU/memory pressure or throttling
-   - Cannot identify resource saturation on nodes
-   - Cannot correlate events with resource exhaustion
-   - Health assessment is INCOMPLETE without metrics
-3. **Recommend remediation**: Deploy metrics-server or equivalent
-4. **Reduce confidence** in health score (cap at 85 if metrics unavailable)
-
-Without metrics, you can only assess:
-✓ Pod status (Running/Pending/Failed)
-✓ Restart counts
-✓ Events (warnings, errors)
-✓ Basic availability
-
-You CANNOT assess without metrics:
-✗ CPU/memory utilization
-✗ Resource pressure or throttling
-✗ Node capacity issues
-✗ OOM risk
-
-## When You Have Enough Information
+_SYSTEM_PROMPT_OUTPUT_FORMAT = """## When You Have Enough Information
 Once you have gathered sufficient data to assess cluster health, provide your final analysis.
 
 ## JSON Output Format
@@ -191,8 +99,200 @@ Your final response must be a valid JSON object with this structure:
     "recommendations": [],
     "observability_recommendations": ["Deploy metrics-server", ...]
   }
-}
-"""
+}"""
+
+
+_FALLBACK_DOCTRINE = """## Fallback Doctrine
+The full inventory of tools you can call is supplied to you as `tools=[...]`.
+Inspect each tool's `name`, `description`, and `inputSchema` before deciding
+which one to call — argument names and tool naming vary across MCP servers,
+so DO NOT assume any specific tool exists; pick by shape and description.
+
+When a tool returns `forbidden`, do NOT retry it.
+When a tool returns `not available` (or a similar "backend missing" error), do
+NOT give up: scan your remaining tools and find one that can answer the same
+question through a different route (e.g. if a snapshot tool is unavailable,
+look for a tool that accepts a query string and ask a timeseries backend).
+Only record an observability gap if you have tried every reasonable
+alternative tool and all of them have failed."""
+
+
+def _render_scope_block(scope: MCPScope) -> str:
+    """
+    Scope-aware preamble. Describes namespace constraints in terms of tool
+    *shapes* (does the schema accept ``namespace``?) — never tool names.
+    """
+    if scope.kind == "namespace" and scope.namespaces:
+        ns = scope.namespaces[0]
+        return (
+            f"## Your Scope\n"
+            f"You operate inside a single Kubernetes namespace: **`{ns}`**.\n"
+            f"The MCP server backing your tools is bound by RBAC to this namespace only.\n"
+            f"You MUST stay within this scope:\n"
+            f"- Always pass `namespace=\"{ns}\"` to any tool whose inputSchema declares a `namespace` argument.\n"
+            f"- Prefer tools whose schema declares a `namespace` parameter.\n"
+            f"- Do NOT call cluster-scoped tools — any tool whose schema does NOT accept `namespace`,\n"
+            f"  including cluster-resource listers and node-level resource probes. They will fail\n"
+            f"  with RBAC `forbidden`.\n"
+            f"- For timeseries queries, pin `{{namespace=\"{ns}\"}}` selectors."
+        )
+    if scope.kind == "namespaces" and scope.namespaces:
+        ns_list = ", ".join(f"`{n}`" for n in scope.namespaces)
+        ns_re = "|".join(scope.namespaces)
+        return (
+            f"## Your Scope\n"
+            f"You may operate across these Kubernetes namespaces: {ns_list}.\n"
+            f"The MCP server's RBAC allows access to each of these — but NO others.\n"
+            f"You MUST:\n"
+            f"- Pass an explicit `namespace=...` argument on every tool call (one of the namespaces above).\n"
+            f"- Prefer tools whose schema declares a `namespace` parameter; do NOT call any tool whose\n"
+            f"  schema does NOT accept `namespace` (cluster-scoped reads will fail with `forbidden`).\n"
+            f"- For timeseries queries, pin `{{namespace=~\"{ns_re}\"}}` selectors."
+        )
+    if scope.kind == "cluster":
+        return (
+            "## Your Scope\n"
+            "The MCP server has cluster-wide RBAC. You may use cluster-scoped tools and\n"
+            "namespace-scoped tools alike.\n"
+            "Still, prefer narrow queries when investigating a specific component to keep results actionable."
+        )
+    return (
+        "## Your Scope\n"
+        "Target scope could not be auto-discovered from the MCP server.\n"
+        "Prefer tools whose schema declares a `namespace` parameter.\n"
+        "Avoid cluster-scoped calls unless you have evidence the MCP service account is authorized cluster-wide."
+    )
+
+
+def _render_resource_metrics_block(scope: MCPScope) -> str:
+    """
+    Describe *what* to gather and the fallback chain, never *which tool* to call.
+    The LLM picks tools at runtime from `tools=[...]` based on description and
+    inputSchema. The PromQL snippets are backend data (cAdvisor / kube-state-metrics
+    series names) — not tool names — and stay valid across any Prometheus-compatible
+    timeseries backend the agent might be wired to.
+    """
+    ns = scope.namespaces[0] if scope.namespaces else None
+    ns_selector = f'namespace="{ns}",' if ns else "namespace=\"<your-namespace>\","
+    ns_only = f'namespace="{ns}"' if ns else "namespace=\"<your-namespace>\""
+    ns_arg = f'`namespace="{ns}"`' if ns else "an explicit `namespace=`"
+    return (
+        "## Resource Metrics\n"
+        f"Primary path — find a tool that returns a per-pod resource snapshot\n"
+        f"(CPU / memory) and accepts {ns_arg}. Call it, and if it returns rows, use them.\n\n"
+        f"Fallback path — if the primary tool is unavailable, returns `not available`,\n"
+        f"or no such tool exists, find a tool that accepts a query string and ask a\n"
+        f"Prometheus-compatible timeseries backend. Pin every query to your namespace:\n"
+        f"  - CPU per pod:    sum by (pod) (rate(container_cpu_usage_seconds_total{{{ns_selector}container!=\"\",container!=\"POD\"}}[2m]))\n"
+        f"  - Memory per pod: sum by (pod) (container_memory_working_set_bytes{{{ns_selector}container!=\"\",container!=\"POD\"}})\n"
+        f"  - Net RX drops:   sum by (pod) (rate(container_network_receive_packets_dropped_total{{{ns_only}}}[2m]))\n"
+        f"  - Net TX drops:   sum by (pod) (rate(container_network_transmit_packets_dropped_total{{{ns_only}}}[2m]))\n"
+        f"    Drop counters are not always emitted; if empty, retry with\n"
+        f"    container_network_receive_errors_total / container_network_transmit_errors_total.\n"
+        f"  - Pod state:      kube_pod_status_phase{{{ns_only}}} == 1\n"
+        f"  - Restarts:       kube_pod_container_status_restarts_total{{{ns_only}}}\n\n"
+        f"Only record `metrics_unavailable` if BOTH paths fail — no snapshot tool AND no\n"
+        f"timeseries-query tool can answer, OR every query returns empty for ≥ 2 attempts."
+    )
+
+
+def _render_chaos_awareness_block(scope: MCPScope) -> str:
+    """
+    Describe chaos-detection signals the LLM should look for and the
+    in-namespace tools shapes it needs (a pod-lister, an event-lister, a
+    timeseries-query tool, a metric-introspection tool). The LLM resolves
+    each shape from `tools=[...]`. If a shape isn't represented in the
+    agent's tool inventory, the corresponding sub-step naturally degrades —
+    the LLM will simply note "no such tool available" for that signal.
+    """
+    ns = scope.namespaces[0] if scope.namespaces else None
+    if not ns:
+        return ""
+    return (
+        "## Chaos Awareness (in-scope, data-driven detection)\n"
+        f"You operate inside ONE namespace. You MUST NOT call any tool with a different\n"
+        f"`namespace` argument. Before recommending remediation for any symptom, attempt\n"
+        f"to determine whether the symptom is being driven by a deliberate disturbance\n"
+        f"scheduled into your namespace. Use whatever tools are available to you:\n\n"
+        f"1. Anomalous pod fleet — list pods in `{ns}` (use a tool whose schema accepts\n"
+        f"   `namespace`). The agent has NO inter-scan memory of pod inventory, so checks\n"
+        f"   must be evaluable from a single snapshot:\n"
+        f"     • pods with ownerReferences whose `kind` is NOT one of\n"
+        f"       Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob — anything\n"
+        f"       else (custom CRD kind) is suspicious\n"
+        f"     • pods with NO ownerRef at all (raw pods are unusual in production namespaces)\n"
+        f"     • pods whose containers terminate-and-restart in a tight loop\n"
+        f"   Capture the pod name, the unfamiliar owner kind, and any annotation/label\n"
+        f"   keys (NOT values — keys are enough to identify the framework at runtime).\n\n"
+        f"2. In-namespace events — list events in `{ns}` (use a tool whose schema accepts\n"
+        f"   `namespace`) and look for reasons containing `Inject`, `Kill`, `Chaos`, `Disrupt`,\n"
+        f"   `Fault`, or events referencing pods that no longer exist. Capture reasons verbatim.\n\n"
+        f"3. Metric-backed disturbance probe — only if you have a tool that lists / introspects\n"
+        f"   the metrics catalogue AND a tool that runs a query string against it:\n"
+        f"   a. Discover available metrics whose name matches `(?i)(chaos|fault|inject|disrupt)`.\n"
+        f"      If none, this step is empty.\n"
+        f"   b. For each candidate series, read its label set. Pick the label whose name contains\n"
+        f"      \"namespace\" or \"ns\" — that is the namespace-scoping label. DO NOT assume a\n"
+        f"      fixed label name.\n"
+        f"   c. Query `<series>{{<discovered-label>=\"{ns}\"}}` grouped by every other label.\n"
+        f"      A non-empty result means a disturbance is currently targeting your namespace.\n\n"
+        f"If ANY step surfaces evidence, classify the symptom as\n"
+        f"`category=\"external-disturbance\"` (or `\"chaos-injected\"` if a metric-backed step\n"
+        f"surfaced matching series — the metric/label values are auditable evidence). Copy the\n"
+        f"discovered marker into `summary`. Set `recommended_action` to monitor for recovery\n"
+        f"rather than mutate the workload. Do NOT delete or scale the suspicious pods themselves.\n\n"
+        f"If NO step surfaced evidence, treat the symptom as a real fault."
+    )
+
+
+def _render_dependency_log_block(scope: MCPScope) -> str:
+    """
+    Drill-down doctrine. Describes what to fetch and how to follow service edges
+    inside the agent's namespace, in terms of tool *shapes* (a log-fetcher, a
+    pod-detail fetcher, a service-detail fetcher, a pod-lister) — the LLM picks
+    each from `tools=[...]`.
+    """
+    ns = scope.namespaces[0] if scope.namespaces else None
+    if not ns:
+        return ""
+    return (
+        "## Dependency Log Drill-Down\n"
+        f"After identifying a problem pod, drill down using whatever tools are available:\n"
+        f"  - fetch the pod's logs (use a tool that takes a pod `name` plus `namespace`;\n"
+        f"    request ~300 lines of tail if a `tail` parameter is supported)\n"
+        f"  - fetch the pod's full description (a tool that takes pod `name` + `namespace`).\n\n"
+        f"If the pod's logs reference a connection-refused / no-reachable-servers / timeout\n"
+        f"to a hostname `X`:\n"
+        f"  - Match `X` against `<service>`, `<service>.{ns}`, or `<service>.{ns}.svc.cluster.local`.\n"
+        f"    If matched, fetch the Service definition (use a tool that takes service `name`\n"
+        f"    + `namespace`), read its `selector`, list pods in `{ns}` whose labels match the\n"
+        f"    selector, then fetch logs for each. All calls stay pinned to `namespace=\"{ns}\"`.\n"
+        f"  - If `X` does not match any of those patterns, treat it as out-of-namespace —\n"
+        f"    do NOT attempt to resolve it, do NOT read pods elsewhere; record `X` as an\n"
+        f"    external dependency in `summary` and move on."
+    )
+
+
+def _build_system_prompt(scope: MCPScope) -> str:
+    """
+    Build a scope-aware system prompt.
+
+    The prompt describes intentions and tool *shapes* — never tool names.
+    The LLM resolves shape → tool at runtime from the ``tools=[...]`` list it
+    receives via the OpenAI function-calling API. This keeps the agent valid
+    against any MCP server set, with any naming convention, with no client-side
+    semantic mapping required.
+    """
+    blocks: List[str] = [
+        _SYSTEM_PROMPT_HEAD,
+        _render_scope_block(scope),
+        _FALLBACK_DOCTRINE,
+        _render_resource_metrics_block(scope),
+        _render_chaos_awareness_block(scope),
+        _render_dependency_log_block(scope),
+        _SYSTEM_PROMPT_OUTPUT_FORMAT,
+    ]
+    return "\n\n".join(b for b in blocks if b)
 
 BASELINE_PROMPT = """You are setting up continuous health monitoring for a Kubernetes namespace.
 
@@ -204,7 +304,7 @@ Select the minimal set of tools to poll repeatedly for monitoring namespace "{na
 These tools will run every few seconds WITHOUT an LLM - only when metrics change will analysis trigger.
 
 ## Selection Guidelines
-- Prefer namespace-scoped tools (e.g., `pods_list_in_namespace` over `pods_list`)
+- Prefer tools whose schema declares a `namespace` parameter over cluster-wide variants.
 - Include pod status monitoring (required)
 - Include events if available (recommended for detecting issues)
 - Do NOT include tools requiring specific pod names (unknown at setup time)
@@ -255,10 +355,10 @@ def _create_openai_client(cfg: AgentConfig) -> OpenAI:
 def _convert_mcp_tool_to_openai(tool_def: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert an MCP tool definition to OpenAI function-calling format.
-    
+
     MCP format:
-        {"name": "pods_list", "description": "...", "inputSchema": {...}}
-    
+        {"name": <tool>, "description": "...", "inputSchema": {...}}
+
     OpenAI format:
         {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
     """
@@ -817,11 +917,12 @@ class FlashAgent:
             baseline_config = self._parse_analysis_response(content)
         except Exception as exc:
             logger.error("Failed to get baseline from LLM: %s", exc)
-            # Fallback: use default tools
+            # Honest degraded fallback: no watch tools, watch loop polls but
+            # never deviates. Caller can re-run establish_baseline once the LLM
+            # is reachable. We deliberately do NOT guess a tool name here —
+            # tool selection is the LLM's job.
             baseline_config = {
-                "watch_tools": [
-                    {"name": "pods_list_in_namespace", "args": {"namespace": namespace}},
-                ],
+                "watch_tools": [],
                 "healthy_thresholds": {
                     "min_pods": 1,
                     "max_restart_delta": 0,

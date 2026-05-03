@@ -50,8 +50,9 @@ class MCPScope:
         return f"{self.kind} (source={self.source})"
 
 
-# Heuristic patterns for picking the introspection / probe tools.
-# Generic across MCP implementations — no specific tool names hardcoded.
+# Heuristic patterns for picking the introspection / probe tools used by
+# scope discovery. These are NOT semantic capability classifiers — they
+# select probe tools whose response can be mined for namespace evidence.
 _INTROSPECTION_NAME_PATTERN = re.compile(
     r"(configuration|context|whoami|server[_-]?info|config[_-]?view|identity)",
     re.IGNORECASE,
@@ -251,7 +252,7 @@ class MCPClient:
 
         client = MCPClient("http://localhost:8086/mcp", "my-agent", timeout=30)
         client.initialize()
-        result = client.call_tool("pods_list_in_namespace", {"namespace": "default"})
+        result = client.call_tool(<tool-name>, {"namespace": "default"})
     """
 
     def __init__(self, url: str, agent_name: str, timeout: int = 30) -> None:
@@ -325,7 +326,7 @@ class MCPClient:
                (almost always equal to the SA's RBAC scope in standard
                co-located Role/RoleBinding deployments) becomes a candidate.
           3. Validate each candidate via a namespace-required read tool
-             (e.g. ``pods_list_in_namespace``). Adopt only the namespaces
+             picked by ``_pick_validation_tool``. Adopt only the namespaces
              that return non-error responses.
           4. No validated candidate → ``unknown``.
 
