@@ -53,7 +53,8 @@ _SYSTEM_PROMPT_HEAD = """You are an ITOps analysis agent with access to Kubernet
 Your task is to analyze the health of your assigned Kubernetes scope by:
 1. Using the available tools to gather information
 2. Investigating any issues you discover
-3. Producing a final structured analysis"""
+3. Producing a final structured analysis
+4. For every actionable issue, giving concrete remediation guidance that tells the operator to remediate and fix the issue when it is safe and authorized to do so"""
 
 
 _SYSTEM_PROMPT_OUTPUT_FORMAT = """## When You Have Enough Information
@@ -90,7 +91,7 @@ Your final response must be a valid JSON object with this structure:
       "component": "component-name",
       "category": "category",
       "summary": "description",
-      "recommended_action": "what to do"
+      "recommended_action": "what to do to remediate and fix the issue"
     }
   ],
   "insights": {
@@ -99,7 +100,12 @@ Your final response must be a valid JSON object with this structure:
     "recommendations": [],
     "observability_recommendations": ["Deploy metrics-server", ...]
   }
-}"""
+}
+
+## Remediation Guidance
+For every issue in the `issues` array, `recommended_action` must be concrete, operational, and fix-oriented.
+Do not stop at diagnosis. When the evidence supports an action, explicitly say to remediate and fix the issue.
+Recommend the safest corrective action available from the observed evidence, and clearly call out when execution should be handled by an operator or automation system."""
 
 
 _FALLBACK_DOCTRINE = """## Fallback Doctrine
@@ -1163,3 +1169,4 @@ class FlashAgent:
             deviations.append(f"new_error_events detected")
         
         return "; ".join(deviations) if deviations else None
+
