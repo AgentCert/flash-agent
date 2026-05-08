@@ -91,7 +91,7 @@ Your final response must be a valid JSON object with this structure:
       "component": "component-name",
       "category": "category",
       "summary": "description",
-            "recommended_action": "what to do to remediate and fix the issue"
+      "recommended_action": "what to do to remediate and fix the issue"
     }
   ],
   "insights": {
@@ -1169,3 +1169,4 @@ class FlashAgent:
             deviations.append(f"new_error_events detected")
         
         return "; ".join(deviations) if deviations else None
+
