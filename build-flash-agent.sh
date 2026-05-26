@@ -80,12 +80,17 @@ sync_live_server_env() {
     openai_api_key="${litellm_master_key}"
   fi
 
+  # Fail loud if MCP URLs are missing from .env — silent fallbacks here were the
+  # root cause of "agent picks :9090 even though .env says :8083" regressions.
+  # The operator must define these in .env; do NOT inject a guess.
   if [ -z "${k8s_mcp_url}" ]; then
-    k8s_mcp_url="http://kubernetes-mcp-server.litmus.svc.cluster.local:8081/mcp"
+    echo "[ERROR] K8S_MCP_URL missing from ${ENV_FILE}; refusing to patch server env with a guess" >&2
+    exit 1
   fi
 
   if [ -z "${prom_mcp_url}" ]; then
-    prom_mcp_url="http://prometheus-mcp-server.litmus.svc.cluster.local:9090/mcp"
+    echo "[ERROR] PROM_MCP_URL missing from ${ENV_FILE}; refusing to patch server env with a guess" >&2
+    exit 1
   fi
 
   if [ -z "${chaos_namespace}" ]; then
