@@ -4,7 +4,10 @@ FROM python:3.12-slim AS builder
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# Strip dev-only deps (pytest, pytest-asyncio) before install so they don't
+# bloat the runtime image. They sit under a "# Dev / test" comment block.
+RUN sed -i '/^# Dev \/ test/,$d' requirements.txt \
+ && pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Final stage
 FROM python:3.12-slim
@@ -21,6 +24,8 @@ COPY --from=builder /install /usr/local
 COPY main.py config.py flash_agent.py ./
 COPY mcp/ ./mcp/
 COPY llm/ ./llm/
+COPY policy/ ./policy/
+COPY memory/ ./memory/
 
 # Set ownership
 RUN chown -R agent:agent /app

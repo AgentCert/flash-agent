@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,6 +42,20 @@ from llm.utils import (
     trim_history_to_token_limit,
 )
 from mcp.client import MCPClient, MCPScope
+from llm.playbook import PlaybookBuilder
+from llm.review import HardActionReviewer
+from memory.episode import MitigationEpisode, ReviewVerdict
+from memory.fingerprint import (
+    fingerprint_issue,
+    fingerprint_tool_call,
+    fingerprints_for_issues,
+    normalize_component,
+)
+from memory.reconciler import ReconcileResult, reconcile_pending_episodes
+from memory.store import MemoryStore, memory_store_from_config
+from policy.audit import AuditLog
+from policy.classifier import classify_and_filter
+from policy.gate import ExecutionGate, synthesize_blocked_result
 
 logger = logging.getLogger("flash-agent")
 
@@ -279,7 +294,60 @@ def _render_dependency_log_block(scope: MCPScope) -> str:
     )
 
 
-def _build_system_prompt(scope: MCPScope) -> str:
+def _render_action_policy_block(
+    scope: MCPScope,
+    cfg: AgentConfig,
+    kept_tools: List[Dict[str, Any]],
+) -> str:
+    """
+    Mitigation-mode action policy. Described in terms of action *shapes*,
+    never specific tool names — the LLM resolves shape → tool at runtime.
+
+    Returned only when ``cfg.agent_mode == "mitigate"``. Observe mode keeps
+    today's prompt unchanged.
+    """
+    if cfg.agent_mode != "mitigate":
+        return ""
+
+    soft_count = sum(1 for t in kept_tools if t.get("_action_class") == "soft")
+    hard_count = sum(1 for t in kept_tools if t.get("_action_class") == "hard")
+    scope_hint = (
+        f" Stay within `{scope.namespaces[0]}`."
+        if scope.kind == "namespace" and scope.namespaces
+        else ""
+    )
+
+    return (
+        "## Action Policy (Mitigation Mode)\n"
+        f"You are authorized to take corrective action on infrastructure issues you find.{scope_hint}\n\n"
+        "Your tool inventory is partitioned by *action shape*:\n"
+        f"  - **soft** ({soft_count} tools): read-shaped — list/get/describe/query/watch. "
+        "Call these freely while investigating.\n"
+        f"  - **hard** ({hard_count} tools): mutating — patch/update/scale/restart/cordon/drain/apply. "
+        "Every call is reviewed twice by an independent reviewer model BEFORE execution. "
+        "Both passes must approve, and you must justify the action by citing concrete "
+        "evidence from prior tool results in this trace. A hard action proposed without "
+        "evidence in the trace will be blocked.\n"
+        "  - **violent** (0 tools shown): delete/destroy/drop/purge/wipe/force-evict. "
+        "These have been filtered out — they are never in your inventory.\n\n"
+        "## Mitigation Doctrine\n"
+        "1. Investigate first with soft tools. Build a concrete evidence chain.\n"
+        "2. Prefer the smallest reversible action that addresses the root cause.\n"
+        "3. After a hard action, do not propose another hard action against the same\n"
+        "   target until you have re-read its state with a soft tool.\n"
+        "4. If a hard action is blocked by review, do not retry the same action in the\n"
+        "   same scan — investigate further or escalate via the analysis summary.\n"
+        "5. Out-of-scope tools will be rejected by the execution gate even if you call\n"
+        "   them; pin every call to your namespace where the schema allows.\n"
+    )
+
+
+def _build_system_prompt(
+    scope: MCPScope,
+    cfg: AgentConfig,
+    kept_tools: List[Dict[str, Any]],
+    playbook_block: str = "",
+) -> str:
     """
     Build a scope-aware system prompt.
 
@@ -293,6 +361,8 @@ def _build_system_prompt(scope: MCPScope) -> str:
         _SYSTEM_PROMPT_HEAD,
         _render_scope_block(scope),
         _FALLBACK_DOCTRINE,
+        _render_action_policy_block(scope, cfg, kept_tools),
+        playbook_block,
         _render_resource_metrics_block(scope),
         _render_chaos_awareness_block(scope),
         _render_dependency_log_block(scope),
@@ -391,6 +461,93 @@ def _convert_mcp_tool_to_openai(tool_def: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _scope_key(scope: Optional[MCPScope]) -> str:
+    """
+    A short, stable identifier for the scope an episode lives in.
+
+    ``namespace:foo`` — single namespace.
+    ``namespaces:foo,bar`` — multiple namespaces (sorted for stability).
+    ``cluster:`` — cluster-wide.
+    ``unknown:`` — auto-discovery failed.
+    """
+    if scope is None:
+        return "unknown:"
+    if scope.kind == "namespace" and scope.namespaces:
+        return f"namespace:{scope.namespaces[0]}"
+    if scope.kind == "namespaces" and scope.namespaces:
+        return "namespaces:" + ",".join(sorted(scope.namespaces))
+    if scope.kind == "cluster":
+        return "cluster:"
+    if scope.kind == "agnostic":
+        return "agnostic:"
+    return f"{scope.kind}:"
+
+
+_DIGIT_RUN = re.compile(r"\d+")
+
+
+def _normalize_component(name: str) -> str:
+    """
+    Normalize a Kubernetes object name so generation suffixes collapse.
+
+    ``cataloguedb-7f8d4c-q9w2`` → ``cataloguedb-*-*``.
+
+    Used by the reconciler so a re-created pod with a different hash still
+    fingerprints to the same component as its predecessor.
+    """
+    if not name:
+        return name
+    parts = name.split("-")
+    out: List[str] = []
+    for part in parts:
+        if _DIGIT_RUN.search(part) and any(ch.isalpha() for ch in part):
+            # alphanumeric segment with digits → likely a hash/generation
+            out.append("*")
+        elif part and all(ch.isdigit() or ch.isalpha() for ch in part) and len(part) <= 10 and any(ch.isdigit() for ch in part) and len(part) >= 5:
+            out.append("*")
+        else:
+            out.append(part)
+    return "-".join(out)
+
+
+# Action-class observation windows (seconds). Selected so the reconciler
+# only judges effectiveness after the action has had time to take effect.
+_OBSERVATION_WINDOWS: Dict[str, float] = {
+    "soft": 60.0,
+    "hard": 120.0,  # generic hard
+}
+
+# Verb-shape overrides — finer-grained than action_class for hard tools.
+_VERB_WINDOW_OVERRIDES: List[Tuple[re.Pattern[str], float]] = [
+    (re.compile(r"(?i)\b(restart|kill|delete[-_]?pod|recreate)\b"), 90.0),
+    (re.compile(r"(?i)\bscale\b"), 120.0),
+    (re.compile(r"(?i)\b(patch|apply|update|set)\b"), 300.0),
+    (re.compile(r"(?i)\b(cordon|drain|evict)\b"), 180.0),
+]
+
+
+def _observation_window_for(action_class: str, tool_def: Dict[str, Any]) -> float:
+    """Pick the observation window for an episode."""
+    name = tool_def.get("name", "") or ""
+    desc = tool_def.get("description", "") or ""
+    haystack = f"{name}\n{desc}"
+    for pat, window in _VERB_WINDOW_OVERRIDES:
+        if pat.search(haystack):
+            return window
+    return _OBSERVATION_WINDOWS.get(action_class, 60.0)
+
+
+def _is_mcp_error_result(result: Dict[str, Any]) -> bool:
+    """Detect both JSON-RPC and MCP-tool-level error shapes."""
+    if not isinstance(result, dict):
+        return True
+    if "error" in result:
+        return True
+    if result.get("isError") is True:
+        return True
+    return False
+
+
 def _format_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
     """Format a tool result for inclusion in conversation."""
     if isinstance(result, dict) and result.get("error"):
@@ -429,11 +586,30 @@ class FlashAgent:
     def __init__(self, cfg: AgentConfig) -> None:
         self.cfg = cfg
         self._scan_counter = 0
-        
+
         # FLASH hindsight components
         self.history: List[Dict[str, Any]] = []
         self.hindsight_builder = HindsightBuilder(cfg)
         self._last_hindsight: str | None = None
+
+        # Mitigation infrastructure (Phase 0+). The audit log is shared by the
+        # classifier, gate, reviewer, and reconciler.
+        self.audit = AuditLog(cfg.mitigation_audit_path)
+        self.reviewer = HardActionReviewer(cfg)
+        self.memory: MemoryStore = memory_store_from_config(cfg)
+        self.playbook = PlaybookBuilder(self.memory)
+        # Trace built during the ReAct loop and read by the reviewer when a
+        # hard action is proposed. Reset on each scan.
+        self._scan_trace: List[Dict[str, Any]] = []
+        # The merged scope is needed by the reviewer hook; set per-scan.
+        self._current_merged_scope: Optional[MCPScope] = None
+        logger.info(
+            "Flash agent init | mode=%s | audit=%s | reviewer_model=%s | memory=%s",
+            cfg.agent_mode,
+            cfg.mitigation_audit_path or "<disabled>",
+            cfg.reviewer_model_alias or f"<degraded:{cfg.model_alias}>",
+            cfg.memory_path or "<in-memory>",
+        )
 
     def scan(self, query: str) -> Dict[str, Any]:
         """Execute one full analysis scan cycle."""
@@ -448,6 +624,9 @@ class FlashAgent:
             self._scan_counter,
             scan_id,
         )
+
+        # Reset per-scan trace consumed by the reviewer.
+        self._scan_trace = []
 
         analysis = self._execute_scan_steps(
             scan_query=query,
@@ -485,7 +664,7 @@ class FlashAgent:
         self._add_to_history("user", f"Query: {scan_query}", {"scan_id": scan_id})
 
         # ── Step 1: Discover MCP tools + scope ───────────────────────────────
-        mcp_tools, mcp_clients, mcp_scopes = self._discover_mcp_tools()
+        mcp_tools, mcp_clients, mcp_scopes, name_to_tool = self._discover_mcp_tools()
 
         if not mcp_tools:
             logger.error("No MCP tools discovered – cannot proceed")
@@ -500,9 +679,25 @@ class FlashAgent:
         merged_scope = self._merge_scopes(list(mcp_scopes.values()))
         logger.info("Discovered scope: %s", merged_scope.describe())
 
+        # Build the execution gate now that we have scopes + classification.
+        gate = ExecutionGate(self.cfg, merged_scope, mcp_scopes, self.audit)
+        self._current_merged_scope = merged_scope
+
         # ── Step 2: Initialize LLM conversation ──────────────────────────────
         client = _create_openai_client(self.cfg)
-        system_prompt = _build_system_prompt(merged_scope)
+        # Build the playbook block from the previous scan's issues — only in
+        # mitigate mode (observe mode keeps today's prompt unchanged).
+        playbook_block = ""
+        if self.cfg.agent_mode == "mitigate":
+            scope_key_for_playbook = _scope_key(merged_scope)
+            prior_issues = self.memory.get_latest_issues(scope_key_for_playbook)
+            playbook_block = self.playbook.render_prompt_block(
+                scope_key=scope_key_for_playbook,
+                current_issues=prior_issues,
+            )
+        system_prompt = _build_system_prompt(
+            merged_scope, self.cfg, mcp_tools, playbook_block
+        )
 
         # Build initial prompt with optional hindsight
         hindsight = self._get_hindsight_for_prompt(scan_id)
@@ -535,6 +730,7 @@ class FlashAgent:
         analysis = None
         iteration = 0
         tool_calls_made: List[str] = []
+        scan_episodes: List[MitigationEpisode] = []
         
         while iteration < MAX_TOOL_ITERATIONS:
             iteration += 1
@@ -580,16 +776,33 @@ class FlashAgent:
                         tool_args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         tool_args = {}
-                    
+
                     logger.info("  Tool call: %s(%s)", tool_name, tool_args)
                     tool_calls_made.append(tool_name)
-                    
-                    # Execute via MCP
-                    result = self._execute_mcp_tool(mcp_clients, tool_name, tool_args)
+
+                    result = self._gated_execute(
+                        gate=gate,
+                        name_to_tool=name_to_tool,
+                        mcp_clients=mcp_clients,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        scan_id=scan_id,
+                        merged_scope=merged_scope,
+                        scan_episodes=scan_episodes,
+                    )
                     result_text = _format_tool_result(tool_name, result)
-                    
+
+                    # Append to the reviewer's evidence trace AFTER the call —
+                    # the reviewer for any *future* hard action call within
+                    # this scan will see this result.
+                    self._scan_trace.append({
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result_text": result_text,
+                    })
+
                     logger.info("  Tool result: %d chars", len(result_text))
-                    
+
                     # Add tool result to conversation
                     messages.append({
                         "role": "tool",
@@ -653,7 +866,55 @@ class FlashAgent:
             "duration_sec": round(duration, 2),
             "tool_calls": tool_calls_made,
             "iterations": iteration,
+            "agent_mode": self.cfg.agent_mode,
+            "scope": merged_scope.describe(),
         }
+
+        # Stamp episodes with the symptom_fingerprint of the issue they
+        # most likely targeted (matched by normalized_component). This is the
+        # link the reconciler uses on the *next* scan. Done here because the
+        # scan's issues list isn't available until analysis is complete.
+        scope_key_for_stamp = _scope_key(merged_scope)
+        issues_by_component: Dict[str, Dict[str, Any]] = {}
+        for issue in issues:
+            comp = normalize_component(str(issue.get("component") or "")) or ""
+            if comp and comp not in issues_by_component:
+                issues_by_component[comp] = issue
+        for ep in scan_episodes:
+            if ep.symptom_fingerprint is None and ep.normalized_component:
+                target_issue = issues_by_component.get(ep.normalized_component)
+                if target_issue is not None:
+                    ep.symptom_fingerprint = fingerprint_issue(target_issue, scope_key_for_stamp)
+                    try:
+                        self.memory.update(ep)
+                    except Exception as exc:
+                        logger.warning("Episode update failed: %s", exc)
+
+        # Surface every executed mitigation so downstream consumers (and the
+        # next scan's reconciler) can see what the agent did.
+        analysis["mitigations_attempted"] = [ep.to_dict() for ep in scan_episodes]
+
+        # Reconcile pending episodes from prior scans against THIS scan's
+        # just-produced issues. Episodes from the current scan stay pending
+        # (window-not-elapsed); episodes from prior scans whose windows have
+        # elapsed transition to succeeded / ineffective / regressed / ambiguous.
+        scope_key = _scope_key(merged_scope)
+        reconciled = self._reconcile_pending_against(scope_key, issues)
+        if reconciled:
+            analysis["reconciled_outcomes"] = [
+                {
+                    "tool": r.episode.tool,
+                    "normalized_component": r.episode.normalized_component,
+                    "transition": r.transition,
+                    "rule": r.rule,
+                    "outcome_evidence": r.episode.outcome_evidence,
+                }
+                for r in reconciled
+            ]
+
+        # Persist this scan's fingerprints + issues so future scans have a
+        # historical record for cross-scan analysis.
+        self._persist_scan_fingerprints(scope_key, scan_id, issues)
         
         if hindsight:
             analysis["hindsight_reflection"] = {
@@ -702,7 +963,12 @@ class FlashAgent:
 
     def _discover_mcp_tools(
         self,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, MCPClient], Dict[str, MCPScope]]:
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        Dict[str, MCPClient],
+        Dict[str, MCPScope],
+        Dict[str, Dict[str, Any]],
+    ]:
         """
         Discover tools and scope from each configured MCP server.
 
@@ -710,12 +976,18 @@ class FlashAgent:
         introspection / probe tools), never the URL or any deployment-shape
         signal. ``cfg.scope_override`` short-circuits discovery when set.
 
+        Tools are classified (Phase 1) and violent tools are filtered out
+        before being returned. The ``name → tool_def`` map lets the ReAct
+        loop and the gate resolve a tool_call name back to its full
+        definition (including ``_mcp_url`` and ``_action_class``).
+
         Returns:
-            ``(all_tool_definitions, {url: client}, {url: scope})``.
+            ``(all_tool_definitions, {url: client}, {url: scope}, {name: tool_def})``.
         """
         all_tools: List[Dict[str, Any]] = []
         clients: Dict[str, MCPClient] = {}
         scopes: Dict[str, MCPScope] = {}
+        name_to_tool: Dict[str, Dict[str, Any]] = {}
         override = self.cfg.scope_override or None
 
         for mcp_url in self.cfg.mcp_urls:
@@ -728,7 +1000,23 @@ class FlashAgent:
                 tools = client.list_tools()
                 for tool in tools:
                     tool["_mcp_url"] = mcp_url  # Track which server has this tool
-                all_tools.extend(tools)
+
+                # Phase 1: classify every tool, drop violent ones before the
+                # LLM ever sees them. Defense-in-depth — even if the gate fails
+                # open, violent tools are not in the inventory.
+                kept, filtered = classify_and_filter(tools, self.cfg, self.audit)
+                if filtered:
+                    logger.info(
+                        "Filtered %d violent tool(s) from %s: %s",
+                        len(filtered),
+                        mcp_url,
+                        [t.get("name", "") for t in filtered],
+                    )
+                for t in kept:
+                    # Last-MCP-wins for duplicate names, same as the legacy
+                    # behavior in `_execute_mcp_tool` which iterated clients.
+                    name_to_tool[t.get("name", "")] = t
+                all_tools.extend(kept)
                 clients[mcp_url] = client
 
                 # Discover this MCP's authorization scope from the server itself.
@@ -744,7 +1032,7 @@ class FlashAgent:
             except Exception as exc:
                 logger.error("Failed to discover tools from %s: %s", mcp_url, exc)
 
-        return all_tools, clients, scopes
+        return all_tools, clients, scopes, name_to_tool
 
     def _execute_mcp_tool(
         self,
@@ -763,8 +1051,341 @@ class FlashAgent:
             except Exception as exc:
                 logger.debug("Tool %s failed on %s: %s", tool_name, mcp_url, exc)
                 continue
-        
+
         return {"error": f"Tool '{tool_name}' not found or failed on all MCP servers"}
+
+    def _gated_execute(
+        self,
+        gate: ExecutionGate,
+        name_to_tool: Dict[str, Dict[str, Any]],
+        mcp_clients: Dict[str, MCPClient],
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        scan_id: str = "",
+        merged_scope: Optional[MCPScope] = None,
+        scan_episodes: Optional[List[MitigationEpisode]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run a single tool call through the execution gate.
+
+        - ``allow`` → executes the MCP call as before (Phase 3 will add the
+          episode-write side-effect for soft mutations).
+        - ``block`` → returns a synthesized MCP-shape error result so the
+          ReAct loop sees a normal tool failure and can re-plan.
+        - ``needs_review`` → handed off to the Phase 4 reviewer when available;
+          until Phase 4 ships this method treats it as ``block`` for safety.
+        """
+        tool_def = name_to_tool.get(tool_name)
+        if tool_def is None:
+            # The LLM hallucinated a tool that isn't in the inventory — surface
+            # a normal tool error so it can re-plan.
+            logger.warning("Unknown tool %r — not in inventory", tool_name)
+            return synthesize_blocked_result(
+                f"unknown tool {tool_name!r} — not in the agent's inventory"
+            )
+
+        action_class = tool_def.get("_action_class", "hard")
+        decision = gate.evaluate(tool_def, tool_args, action_class)
+
+        if decision.decision == "block":
+            logger.info(
+                "  Gate BLOCK %s: %s (rule=%s)",
+                tool_name,
+                decision.reason,
+                decision.rule,
+            )
+            return synthesize_blocked_result(decision.reason)
+
+        review_iterations: List[Dict[str, Any]] = []
+        if decision.decision == "needs_review":
+            review_result, review_iterations = self._review_hard_action(
+                tool_def=tool_def,
+                tool_args=tool_args,
+            )
+            if review_result is not None:
+                # A blocked-by-review episode is still informative — record it
+                # so the playbook learns "we proposed X but reviewer denied".
+                if self.cfg.agent_mode == "mitigate":
+                    self._record_episode(
+                        scan_id=scan_id,
+                        scope=merged_scope,
+                        tool_def=tool_def,
+                        tool_args=tool_args,
+                        action_class=action_class,
+                        outcome="blocked-by-review",
+                        review_iterations=review_iterations,
+                        scan_episodes=scan_episodes,
+                    )
+                return review_result
+
+        # ``allow`` (or review approved): execute via the MCP client.
+        result = self._execute_mcp_tool(mcp_clients, tool_name, tool_args)
+
+        # Record an episode for any successful mutating action while in
+        # mitigate mode. Pure reads in observe mode never produce episodes —
+        # the audit log already records the gate decision.
+        if (
+            self.cfg.agent_mode == "mitigate"
+            and action_class in ("soft", "hard")
+            and not _is_mcp_error_result(result)
+        ):
+            # Soft-class reads still pass through and would technically log
+            # episodes, but the reconciler only cares about mutations. We
+            # mark them anyway — the playbook builder ignores read-shape
+            # tools by checking the `tool` field against the action_class
+            # patterns. The audit trail benefit outweighs a few extra rows.
+            self._record_episode(
+                scan_id=scan_id,
+                scope=merged_scope,
+                tool_def=tool_def,
+                tool_args=tool_args,
+                action_class=action_class,
+                outcome="pending",
+                review_iterations=review_iterations,
+                scan_episodes=scan_episodes,
+            )
+        return result
+
+    def _review_hard_action(
+        self,
+        tool_def: Dict[str, Any],
+        tool_args: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Run the two-pass adversarial reviewer (Phase 4).
+
+        Returns ``(maybe_blocked_result, iterations)``:
+          - ``maybe_blocked_result is None`` → every pass APPROVED; caller may execute.
+          - ``maybe_blocked_result is a dict`` → at least one pass BLOCKED;
+            feed back to the LLM as an MCP-shape error.
+          - ``iterations`` is the list of per-pass verdicts (as plain dicts).
+        """
+        tool_name = tool_def.get("name", "")
+        symptom_context, prior_evidence = self._build_review_context()
+
+        # Pull cached prior episodes for this same fingerprint, if Phase 7 is
+        # wired. ``prior_evidence`` is amended by the playbook hook below.
+        prior_evidence = self._augment_prior_evidence(
+            tool_def=tool_def,
+            tool_args=tool_args,
+            prior_evidence=prior_evidence,
+        )
+
+        verdicts = self.reviewer.review_twice(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_def=tool_def,
+            symptom_context=symptom_context,
+            prior_evidence=prior_evidence,
+        )
+
+        iteration_dicts: List[Dict[str, Any]] = []
+        for v in verdicts:
+            d = v.__dict__ if not isinstance(v, dict) else v
+            iteration_dicts.append(dict(d))
+            self.audit.write(
+                "review_verdict",
+                {
+                    "tool": tool_name,
+                    "iteration": d.get("iteration"),
+                    "framing": d.get("framing"),
+                    "verdict": d.get("verdict"),
+                    "model": d.get("model"),
+                    "degraded": d.get("degraded", False),
+                    "evidence_count": len(d.get("evidence_used", []) or []),
+                },
+            )
+
+        blocked = next(
+            (v for v in verdicts if v.verdict == "BLOCKED"),
+            None,
+        )
+        if blocked is not None:
+            reason = (
+                f"review blocked at iter={blocked.iteration} ({blocked.framing}): "
+                f"{blocked.reasoning[:300]}"
+            )
+            logger.info("  Reviewer BLOCKED %s: %s", tool_name, reason)
+            return synthesize_blocked_result(reason), iteration_dicts
+
+        # All passes approved.
+        logger.info(
+            "  Reviewer APPROVED %s (%d passes)", tool_name, len(verdicts)
+        )
+        return None, iteration_dicts
+
+    def _build_review_context(self) -> Tuple[str, str]:
+        """
+        Materialise the ``symptom_context`` and ``prior_evidence`` strings from
+        the in-scan trace. Used by the reviewer to ground its verdict.
+
+        Returns ``(symptom_context, prior_evidence)``.
+        """
+        if not self._scan_trace:
+            return "(no prior tool calls in this scan)", "(no prior evidence)"
+
+        # ``symptom_context`` is the user prompt's framing (kept short).
+        # ``prior_evidence`` is the recent tool-call trace (compact).
+        lines: List[str] = []
+        for entry in self._scan_trace[-12:]:  # last 12 calls is enough
+            tool = entry.get("tool", "")
+            args = entry.get("args", {})
+            result = entry.get("result_text", "")
+            # Trim very long results — reviewer needs gist, not every byte.
+            if len(result) > 800:
+                result = result[:800] + "...(truncated)"
+            lines.append(f"- tool={tool} args={args}\n  result={result}")
+        prior_evidence = "\n".join(lines)
+        symptom_context = (
+            f"This scan has issued {len(self._scan_trace)} tool calls; "
+            f"the most recent results are shown as prior evidence."
+        )
+        return symptom_context, prior_evidence
+
+    def _augment_prior_evidence(
+        self,
+        tool_def: Dict[str, Any],
+        tool_args: Dict[str, Any],
+        prior_evidence: str,
+    ) -> str:
+        """Prepend prior-episode evidence for this same tool-call shape."""
+        scope_key = _scope_key(self._current_merged_scope)
+        review_history = self.playbook.summarize_for_review(
+            tool_name=tool_def.get("name", ""),
+            tool_args=tool_args,
+            scope_key=scope_key,
+        )
+        if not review_history:
+            return prior_evidence
+        return f"{review_history}\n\n{prior_evidence}"
+
+    def _record_episode(
+        self,
+        scan_id: str,
+        scope: Optional[MCPScope],
+        tool_def: Dict[str, Any],
+        tool_args: Dict[str, Any],
+        action_class: str,
+        outcome: str,
+        review_iterations: List[Dict[str, Any]],
+        scan_episodes: Optional[List[MitigationEpisode]] = None,
+    ) -> MitigationEpisode:
+        """
+        Build a ``MitigationEpisode`` from a tool call and audit-log it.
+
+        Phase 5 wires this through to the persistent memory store. For now
+        the record exists in the in-scan list and the audit log.
+        """
+        scope_key = _scope_key(scope)
+        # Heuristic component-extraction — try the most-common tool arg names
+        # for an "object name". Used by the reconciler to attribute outcomes.
+        component = (
+            tool_args.get("name")
+            or tool_args.get("pod")
+            or tool_args.get("deployment")
+            or tool_args.get("service")
+            or tool_args.get("workload")
+        )
+        normalized = _normalize_component(component) if isinstance(component, str) else None
+
+        episode = MitigationEpisode(
+            scan_id=scan_id,
+            ts=time.time(),
+            scope_key=scope_key,
+            tool=tool_def.get("name", ""),
+            args=dict(tool_args),
+            action_class=action_class,
+            normalized_component=normalized,
+            review_iterations=list(review_iterations),
+            outcome=outcome,  # type: ignore[arg-type]
+            mcp_url=tool_def.get("_mcp_url", ""),
+        )
+
+        # Phase 6 will compute min_observe_until_ts at this point.
+        episode.min_observe_until_ts = episode.ts + _observation_window_for(
+            action_class, tool_def
+        )
+
+        # Audit log unconditionally. Phase 5 also writes to the memory store.
+        self.audit.write(
+            "episode_created",
+            {
+                "scan_id": scan_id,
+                "scope_key": scope_key,
+                "tool": episode.tool,
+                "action_class": action_class,
+                "outcome": outcome,
+                "normalized_component": normalized,
+                "mcp_url": episode.mcp_url,
+                "min_observe_until_ts": episode.min_observe_until_ts,
+            },
+        )
+
+        # Phase 5 hook: persist to store.
+        self._persist_episode(episode)
+
+        if scan_episodes is not None:
+            scan_episodes.append(episode)
+        return episode
+
+    def _persist_episode(self, episode: MitigationEpisode) -> None:
+        """Persist an episode to the configured store (Phase 5)."""
+        try:
+            self.memory.append(episode)
+        except Exception as exc:
+            # The audit log + in-scan list are the source of truth for this
+            # scan; a failed persist degrades gracefully.
+            logger.warning("Memory store append failed: %s", exc)
+
+    def _reconcile_pending_against(
+        self,
+        scope_key: str,
+        current_issues: List[Dict[str, Any]],
+    ) -> List[ReconcileResult]:
+        """
+        Phase 6: reconcile pending episodes against the supplied issue set.
+
+        Called at the END of a scan with the scan's just-produced issues, so
+        the reconciler judges prior-scan actions against the freshest cluster
+        state available. Episodes from the current scan typically stay
+        ``pending`` because their observation window has not elapsed.
+        """
+        try:
+            results = reconcile_pending_episodes(
+                store=self.memory,
+                current_issues=current_issues,
+                scope_key=scope_key,
+                now=time.time(),
+            )
+        except Exception as exc:
+            logger.warning("Reconciliation failed: %s", exc)
+            return []
+
+        for r in results:
+            self.audit.write(
+                "reconcile_transition",
+                {
+                    "scope_key": scope_key,
+                    "tool": r.episode.tool,
+                    "normalized_component": r.episode.normalized_component,
+                    "transition": r.transition,
+                    "rule": r.rule,
+                },
+            )
+        return results
+
+    def _persist_scan_fingerprints(
+        self,
+        scope_key: str,
+        scan_id: str,
+        issues: List[Dict[str, Any]],
+    ) -> None:
+        """Phase 6: persist this scan's issue fingerprints for next-scan reconciliation."""
+        try:
+            fps = fingerprints_for_issues(issues, scope_key)
+            self.memory.put_fingerprints(scope_key, scan_id, fps, issues=issues)
+        except Exception as exc:
+            logger.warning("Fingerprint snapshot persist failed: %s", exc)
 
     def _parse_analysis_response(self, content: str) -> Dict[str, Any]:
         """
@@ -884,7 +1505,7 @@ class FlashAgent:
 
         # Discover available MCP tools (scope info ignored — namespace is given
         # explicitly by the caller in watch mode).
-        mcp_tools, mcp_clients, _ = self._discover_mcp_tools()
+        mcp_tools, mcp_clients, _, _ = self._discover_mcp_tools()
         if not mcp_tools:
             raise RuntimeError("No MCP tools discovered - cannot establish baseline")
         
@@ -973,7 +1594,7 @@ class FlashAgent:
             baseline.namespace, poll_interval, len(baseline.watch_tools),
         )
         
-        mcp_tools, mcp_clients, _ = self._discover_mcp_tools()
+        mcp_tools, mcp_clients, _, _ = self._discover_mcp_tools()
         if not mcp_clients:
             logger.error("No MCP clients available for watch")
             return

@@ -159,16 +159,53 @@ docker tag "${IMAGE}" agentcert/agentcert-flash-agent:latest
 docker tag "${IMAGE}" agentcert/agentcert-flash-agent:dev
 echo "[OK] Docker build completed"
 
-echo "[INFO] Cleaning up old images from minikube..."
-# Remove old ci-* tags from minikube (keep only latest, dev, and the new one)
-minikube image ls | grep "agentcert-flash-agent:ci-" | grep -v "${IMAGE_TAG}" | awk '{print $1}' | xargs -r minikube image rm 2>/dev/null || true
-echo "[OK] Old minikube images cleaned"
+load_into_minikube() {
+  if ! command -v minikube >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! minikube status >/dev/null 2>&1; then
+    return 1
+  fi
+  echo "[INFO] Cleaning up old images from minikube..."
+  minikube image ls | grep "agentcert-flash-agent:ci-" | grep -v "${IMAGE_TAG}" | awk '{print $1}' | xargs -r minikube image rm 2>/dev/null || true
+  echo "[INFO] Loading into minikube..."
+  minikube image load "${IMAGE}"
+  minikube image load agentcert/agentcert-flash-agent:latest
+  minikube image load agentcert/agentcert-flash-agent:dev
+  echo "[OK] Images loaded into minikube"
+  return 0
+}
 
-echo "[INFO] Loading into minikube..."
-minikube image load "${IMAGE}"
-minikube image load agentcert/agentcert-flash-agent:latest
-minikube image load agentcert/agentcert-flash-agent:dev
-echo "[OK] Images loaded into minikube"
+load_into_kind() {
+  if ! command -v kind >/dev/null 2>&1; then
+    return 1
+  fi
+  # Pick the first kind cluster; the monorepo default is "agentcert" but tolerate others.
+  local cluster
+  cluster=$(kind get clusters 2>/dev/null | head -n1)
+  if [ -z "${cluster}" ]; then
+    return 1
+  fi
+  echo "[INFO] Loading into kind cluster '${cluster}'..."
+  # kind doesn't dedupe by digest — load each tag explicitly so :latest inside
+  # the cluster also gets retagged to the new image, not just :dev/:ci-*.
+  kind load docker-image "${IMAGE}" --name "${cluster}"
+  kind load docker-image agentcert/agentcert-flash-agent:latest --name "${cluster}"
+  kind load docker-image agentcert/agentcert-flash-agent:dev --name "${cluster}"
+  echo "[OK] Images loaded into kind cluster '${cluster}'"
+  return 0
+}
+
+loaded_into_cluster=0
+if load_into_kind; then
+  loaded_into_cluster=1
+fi
+if load_into_minikube; then
+  loaded_into_cluster=1
+fi
+if [ "${loaded_into_cluster}" -eq 0 ]; then
+  echo "[WARN] No reachable kind or minikube cluster — image stays in host docker only."
+fi
 
 # Update .env with :latest tag instead of timestamped version
 # This ensures consistent deployment across restarts and scales
