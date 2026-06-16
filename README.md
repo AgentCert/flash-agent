@@ -18,7 +18,7 @@ methodology, cited directly in the source.
 ![MCP](https://img.shields.io/badge/MCP-JSON--RPC%202.0%20%2B%20SSE-1C3D5A?style=flat-square)
 ![Loop](https://img.shields.io/badge/Loop-ReAct%20%2B%20Hindsight-EF7B4D?style=flat-square)
 ![FLASH](https://img.shields.io/badge/FLASH-Microsoft%20Research-7E47C5?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
+![License](https://img.shields.io/badge/License-Apache%202.0-lightgrey?style=flat-square)
 
 </div>
 
@@ -561,4 +561,4 @@ that to a particular chaos experiment is the sidecar's responsibility (it inject
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
